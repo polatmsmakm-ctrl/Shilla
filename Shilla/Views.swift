@@ -650,7 +650,7 @@ struct ChatView: View {
             Task {
                 var urls: [URL] = []
                 for it in items {
-                    if let f = try? await it.loadTransferable(type: PickedMedia.self) { urls.append(f.url) }
+                    if let f = try? await it.loadTransferable(type: PickedMedia.self) { urls.append(Self.keep(f.url)) }
                 }
                 photoItems = []
                 app.startSend(urls: urls, to: peer)
@@ -658,13 +658,19 @@ struct ChatView: View {
         }
     }
 
+    private static func keep(_ tmp: URL) -> URL {
+        let fm = FileManager.default
+        let dir = Paths.documents.appendingPathComponent("Sent/" + UUID().uuidString, isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dst = dir.appendingPathComponent(tmp.lastPathComponent)
+        do { try fm.moveItem(at: tmp, to: dst); return dst } catch { return tmp }
+    }
+
     private func pick(folder: Bool) {
-        showAttach = false
-        // ننتظر لين تسكّر نافذة الإرفاق عشان ما يتعارض العرضين
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            DocPicker.shared.present(folder: folder) { urls in
-                app.startSend(urls: urls, to: peer)
-            }
+        // نعرض الاختيار فوق نافذة الإرفاق نفسها (بدون ما نسكّرها قبل) عشان ما يتعارض العرضين
+        DocPicker.shared.present(folder: folder) { urls in
+            showAttach = false
+            app.startSend(urls: urls, to: peer)
         }
     }
 
@@ -852,7 +858,7 @@ struct FileCard: View {
                 Text(live?.note.isEmpty == false ? live!.note : "ما اكتمل النقل")
                     .font(.caption).foregroundColor(Color(hex: 0xFF6B6B))
             }
-            if done, !m.outgoing, let url = app.fileURL(for: m) {
+            if done || m.outgoing, let url = app.fileURL(for: m) {
                 actions(url)
             }
             HStack {

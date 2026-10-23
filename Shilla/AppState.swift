@@ -425,12 +425,19 @@ final class AppState: ObservableObject {
             if listing.files.isEmpty { showToast("ما لقيت ملفات داخل: \(url.lastPathComponent)"); continue }
 
             let bid = UUID().uuidString
+            var sentRel: String? = nil
+            let docPath = Paths.documents.standardizedFileURL.path + "/"
+            if url.standardizedFileURL.path.hasPrefix(docPath) {
+                sentRel = String(url.standardizedFileURL.path.dropFirst(docPath.count))
+            } else if let bm = try? url.bookmarkData() {
+                UserDefaults.standard.set(bm, forKey: "bm_" + bid)
+            }
             let total = listing.files.reduce(Int64(0)) { $0 + $1.size }
             let kind = listing.isFolder ? "folder" : Fmt.kind(of: url.lastPathComponent)
             let batch = BatchInfo(bid: bid, name: url.lastPathComponent, size: total,
                                   count: listing.files.count, isFolder: listing.isFolder, kind: kind)
             appendMessage(ChatMessage(id: bid, peer: peer, ts: Date().timeIntervalSince1970, text: nil,
-                                      batch: batch, outgoing: true, localRel: nil, status: "active", delivered: nil))
+                                      batch: batch, outgoing: true, localRel: sentRel, status: "active", delivered: nil))
             progress[bid] = TransferState()
             refreshActivity()
 
@@ -515,7 +522,16 @@ final class AppState: ObservableObject {
     // MARK: أدوات
 
     func fileURL(for m: ChatMessage) -> URL? {
-        guard let rel = m.localRel else { return nil }
+        guard let rel = m.localRel else {
+            if m.outgoing, let bm = UserDefaults.standard.data(forKey: "bm_" + m.id) {
+                var stale = false
+                if let u = try? URL(resolvingBookmarkData: bm, bookmarkDataIsStale: &stale) {
+                    _ = u.startAccessingSecurityScopedResource()
+                    return FileManager.default.fileExists(atPath: u.path) ? u : nil
+                }
+            }
+            return nil
+        }
         let u = Paths.documents.appendingPathComponent(rel)
         return FileManager.default.fileExists(atPath: u.path) ? u : nil
     }

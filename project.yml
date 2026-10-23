@@ -1,0 +1,31 @@
+name: Shilla
+options:
+  bundleIdPrefix: com.rashid
+  deploymentTarget:
+    iOS: "16.0"
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    from: 125.0.0
+targets:
+  Shilla:
+    type: application
+    platform: iOS
+    sources:
+      - Shilla
+    dependencies:
+      - package: WebRTC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rashid.shilla
+        PRODUCT_NAME: Shilla
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Shilla/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_BITCODE: NO

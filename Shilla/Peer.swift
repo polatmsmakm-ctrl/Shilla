@@ -1,6 +1,11 @@
 import Foundation
 import WebRTC
 
+/// عدد القنوات المتوازية لكل ملف
+private let kStripes = 4
+/// حجم القطعة (بدون الترويسة)
+private let kChunk = 65_528
+
 /// اتصال مباشر (WebRTC) مع صديق واحد.
 final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     static let factory: RTCPeerConnectionFactory = {
@@ -15,20 +20,21 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     private var pc: RTCPeerConnection!
     private var ctl: RTCDataChannel?
     private let sendSignal: ([String: Any]) -> Void
-    private let makeIncoming: (RTCDataChannel) -> IncomingFile
+    private let makeIncoming: (String) -> IncomingFile
     private var pending: [RTCIceCandidate] = []
     private let lock = NSLock()
     private var outs: [ObjectIdentifier: OutgoingFile] = [:]
-    private var ins: [ObjectIdentifier: IncomingFile] = [:]
+    private var ins: [String: IncomingFile] = [:]
     private let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
 
     private(set) var hasRemote = false
     private(set) var isConnected = false
+    private(set) var state = "connecting"
 
     init(peerId: String,
          initiator: Bool,
          sendSignal: @escaping ([String: Any]) -> Void,
-         makeIncoming: @escaping (RTCDataChannel) -> IncomingFile) {
+         makeIncoming: @escaping (String) -> IncomingFile) {
         self.peerId = peerId
         self.initiator = initiator
         self.sendSignal = sendSignal
@@ -47,6 +53,7 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
         }
         cfg.iceServers = servers
         cfg.sdpSemantics = .unifiedPlan
+        cfg.continualGatheringPolicy = .gatherContinually
         pc = PeerLink.factory.peerConnection(with: cfg, constraints: constraints, delegate: self)
     }
 
@@ -58,7 +65,7 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
         pc.offer(for: constraints) { [weak self] sdp, _ in
             guard let self, let sdp else { return }
             self.pc.setLocalDescription(sdp) { _ in
-                self.sendSignal(["type": "offer", "sdp": sdp.sdp])
+                self.sendSignal(["t": "offer", "sdp": sdp.sdp])
             }
         }
     }
@@ -71,7 +78,7 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
             self.pc.answer(for: self.constraints) { ans, _ in
                 guard let ans else { return }
                 self.pc.setLocalDescription(ans) { _ in
-                    self.sendSignal(["type": "answer", "sdp": ans.sdp])
+                    self.sendSignal(["t": "answer", "sdp": ans.sdp])
                 }
             }
         }
@@ -101,19 +108,24 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
 
     func sendFile(meta: [String: Any], url: URL, size: UInt64,
                   onProgress: @escaping (Int64) -> Void) async throws {
-        let cfg = RTCDataChannelConfiguration()
-        cfg.isOrdered = true
-        guard let dc = pc.dataChannel(forLabel: "f:" + UUID().uuidString, configuration: cfg) else {
-            throw TErr.closed
+        let tid = UUID().uuidString
+        var dcs: [RTCDataChannel] = []
+        for i in 0..<kStripes {
+            let cfg = RTCDataChannelConfiguration()
+            cfg.isOrdered = false // بدون انتظار ترتيب = أسرع
+            guard let dc = pc.dataChannel(forLabel: "f:\(tid):\(i)", configuration: cfg) else { throw TErr.closed }
+            dcs.append(dc)
         }
-        let out = OutgoingFile(dc: dc)
+        let out = OutgoingFile(dcs: dcs)
         let key = ObjectIdentifier(out)
         lock.lock(); outs[key] = out; lock.unlock()
         defer {
             lock.lock(); outs[key] = nil; lock.unlock()
-            dc.close()
+            dcs.forEach { $0.close() }
         }
-        try await out.run(meta: meta, url: url, size: size, onProgress: onProgress)
+        var m = meta
+        m["tid"] = tid
+        try await out.run(meta: m, url: url, size: size, onProgress: onProgress)
     }
 
     func close() {
@@ -144,6 +156,7 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
         case .closed: s = "closed"
         default: s = "connecting"
         }
+        state = s
         isConnected = (s == "connected")
         if s == "failed" || s == "closed" {
             lock.lock()
@@ -157,25 +170,34 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
-        sendSignal(["type": "ice",
+        sendSignal(["t": "ice",
                     "candidate": candidate.sdp,
                     "mline": Int(candidate.sdpMLineIndex),
                     "mid": candidate.sdpMid ?? ""])
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
-        guard dataChannel.label.hasPrefix("f:") else { return }
-        // لازم نربط المستقبِل فوراً حتى ما تضيع أول رسالة
-        let inc = makeIncoming(dataChannel)
-        let key = ObjectIdentifier(inc)
-        inc.onClosed = { [weak self] in
-            self?.lock.lock(); self?.ins[key] = nil; self?.lock.unlock()
+        let parts = dataChannel.label.split(separator: ":").map(String.init)
+        guard parts.count == 3, parts[0] == "f" else { return }
+        let tid = parts[1]
+        lock.lock()
+        let inc: IncomingFile
+        if let e = ins[tid] {
+            inc = e
+        } else {
+            inc = makeIncoming(tid)
+            inc.onClosed = { [weak self] in
+                self?.lock.lock(); self?.ins[tid] = nil; self?.lock.unlock()
+            }
+            ins[tid] = inc
         }
-        lock.lock(); ins[key] = inc; lock.unlock()
+        lock.unlock()
+        // الربط لازم يكون فوري حتى ما تضيع أول رسالة
+        inc.attach(dataChannel)
     }
 }
 
-// MARK: - المُرسِل لملف واحد
+// MARK: - المُرسِل لملف واحد (عدة قنوات متوازية)
 
 enum OutEvent {
     case open
@@ -184,18 +206,20 @@ enum OutEvent {
 }
 
 final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable {
-    let dc: RTCDataChannel
+    let dcs: [RTCDataChannel]
     private let stream: AsyncStream<OutEvent>
     private let cont: AsyncStream<OutEvent>.Continuation
 
-    init(dc: RTCDataChannel) {
-        self.dc = dc
+    init(dcs: [RTCDataChannel]) {
+        self.dcs = dcs
         var c: AsyncStream<OutEvent>.Continuation!
         self.stream = AsyncStream { c = $0 }
         self.cont = c
         super.init()
-        dc.delegate = self
+        dcs.forEach { $0.delegate = self }
     }
+
+    private var ctl: RTCDataChannel { dcs[0] }
 
     func abort() {
         cont.yield(.closed)
@@ -203,6 +227,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
     }
 
     func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
+        guard dataChannel === ctl else { return }
         switch dataChannel.readyState {
         case .open: cont.yield(.open)
         case .closing, .closed: cont.yield(.closed)
@@ -211,6 +236,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
     }
 
     func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RTCDataBuffer) {
+        guard dataChannel === ctl else { return }
         if !buffer.isBinary, let s = String(data: buffer.data, encoding: .utf8) {
             cont.yield(.text(s))
         }
@@ -220,7 +246,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
              onProgress: @escaping (Int64) -> Void) async throws {
         var it = stream.makeAsyncIterator()
 
-        if dc.readyState != .open {
+        if ctl.readyState != .open {
             var opened = false
             while let ev = await it.next() {
                 if case .open = ev { opened = true; break }
@@ -230,7 +256,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
         }
 
         let metaData = try JSONSerialization.data(withJSONObject: meta)
-        guard dc.sendData(RTCDataBuffer(data: metaData, isBinary: false)) else { throw TErr.closed }
+        guard ctl.sendData(RTCDataBuffer(data: metaData, isBinary: false)) else { throw TErr.closed }
 
         // المستقبِل يرد بالمكان اللي وصل له (للاستكمال)
         var offset: UInt64 = 0
@@ -251,7 +277,6 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
         if offset < size {
             try await pump(url: url, offset: offset, size: size, onProgress: onProgress)
         }
-        onProgress(Int64(size))
 
         var okSeen = false
         while let ev = await it.next() {
@@ -259,6 +284,22 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
             if case .closed = ev { throw TErr.closed }
         }
         if !okSeen { throw TErr.closed }
+        onProgress(Int64(size))
+    }
+
+    private func pickChannel() -> RTCDataChannel? {
+        var best: RTCDataChannel?
+        var bestBuf = UInt64.max
+        for c in dcs where c.readyState == .open {
+            let b = c.bufferedAmount
+            if b < bestBuf { best = c; bestBuf = b }
+        }
+        if let b = best, bestBuf < 3_000_000 { return b }
+        return nil
+    }
+
+    private func totalBuffered() -> UInt64 {
+        dcs.reduce(UInt64(0)) { $0 + $1.bufferedAmount }
     }
 
     private func pump(url: URL, offset: UInt64, size: UInt64,
@@ -267,22 +308,35 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
         defer { try? h.close() }
         try h.seek(toOffset: offset)
         var sent = offset
+        var lastReport = Date.distantPast
         while sent < size {
-            if Task.isCancelled || dc.readyState != .open { throw TErr.closed }
+            if Task.isCancelled || ctl.readyState != .open { throw TErr.closed }
             guard let block = try h.read(upToCount: 1 << 20), !block.isEmpty else { break }
             var i = 0
             while i < block.count {
-                while dc.bufferedAmount > 4_000_000 {
-                    if dc.readyState != .open { throw TErr.closed }
-                    try await Task.sleep(nanoseconds: 4_000_000)
+                let end = min(i + kChunk, block.count)
+                var frame = Data(capacity: 8 + (end - i))
+                var be = (sent + UInt64(i)).bigEndian
+                withUnsafeBytes(of: &be) { frame.append(contentsOf: $0) }
+                frame.append(block.subdata(in: i..<end))
+                while true {
+                    if ctl.readyState != .open { throw TErr.closed }
+                    if let ch = pickChannel() {
+                        if !ch.sendData(RTCDataBuffer(data: frame, isBinary: true)) { throw TErr.closed }
+                        break
+                    }
+                    try await Task.sleep(nanoseconds: 2_000_000)
                 }
-                let end = min(i + 65_536, block.count)
-                let chunk = block.subdata(in: (block.startIndex + i)..<(block.startIndex + end))
-                if !dc.sendData(RTCDataBuffer(data: chunk, isBinary: true)) { throw TErr.closed }
                 i = end
             }
             sent += UInt64(block.count)
-            onProgress(Int64(sent))
+            let now = Date()
+            if now.timeIntervalSince(lastReport) > 0.12 {
+                lastReport = now
+                let inflight = totalBuffered()
+                let confirmed = sent > inflight ? sent - inflight : 0
+                onProgress(Int64(confirmed))
+            }
         }
     }
 }

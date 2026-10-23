@@ -3,73 +3,333 @@ import PhotosUI
 import QuickLook
 import UniformTypeIdentifiers
 
-// MARK: - الدردشة
+// MARK: - الثيم
+
+enum Theme {
+    static let brand = LinearGradient(
+        colors: [Color(red: 0.30, green: 0.42, blue: 1.0), Color(red: 0.60, green: 0.30, blue: 0.96)],
+        startPoint: .topLeading, endPoint: .bottomTrailing)
+
+    static func avatar(_ name: String) -> LinearGradient {
+        var h = 0
+        for s in name.unicodeScalars { h = (h &* 31 &+ Int(s.value)) & 0xFFFF }
+        let hue = Double(h % 360) / 360
+        return LinearGradient(
+            colors: [Color(hue: hue, saturation: 0.55, brightness: 0.96),
+                     Color(hue: (hue + 0.08).truncatingRemainder(dividingBy: 1), saturation: 0.75, brightness: 0.78)],
+            startPoint: .top, endPoint: .bottom)
+    }
+}
+
+struct Avatar: View {
+    let name: String
+    var size: CGFloat = 48
+    var online: Bool? = nil
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            Circle().fill(Theme.avatar(name))
+                .frame(width: size, height: size)
+                .overlay(
+                    Text(String(name.prefix(1)).uppercased())
+                        .font(.system(size: size * 0.42, weight: .bold, design: .rounded))
+                        .foregroundColor(.white))
+            if let on = online {
+                Circle().fill(on ? Color.green : Color.gray)
+                    .frame(width: size * 0.28, height: size * 0.28)
+                    .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
+            }
+        }
+    }
+}
+
+// MARK: - الترحيب
+
+struct WelcomeView: View {
+    @EnvironmentObject var app: AppState
+    @State private var name = ""
+    @State private var error = false
+
+    var body: some View {
+        ZStack {
+            Theme.brand.ignoresSafeArea()
+            VStack(spacing: 22) {
+                Spacer()
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .fill(.white)
+                    .frame(width: 96, height: 96)
+                    .overlay(
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 42))
+                            .foregroundStyle(Theme.brand))
+                    .shadow(color: .black.opacity(0.2), radius: 16, y: 8)
+                Text("الشلّة").font(.system(size: 40, weight: .heavy, design: .rounded)).foregroundColor(.white)
+                Text("رسائل وملفات ضخمة بأقصى سرعة\nمباشرة بينك وبين أصدقائك")
+                    .multilineTextAlignment(.center)
+                    .foregroundColor(.white.opacity(0.9))
+                Spacer()
+                VStack(spacing: 12) {
+                    HStack {
+                        Text("@").foregroundColor(.secondary)
+                        TextField("اسم المستخدم", text: $name)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .environment(\.layoutDirection, .leftToRight)
+                            .onChange(of: name) { v in
+                                let f = String(v.lowercased().filter { "abcdefghijklmnopqrstuvwxyz0123456789_".contains($0) }.prefix(20))
+                                if f != v { name = f }
+                                error = false
+                            }
+                    }
+                    .padding(14)
+                    .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 14))
+                    Text(error ? "اكتب من 3 إلى 20 حرف إنجليزي أو أرقام" : "اسم ثابت يعرفك فيه أصدقاؤك، ما يحتاج كود")
+                        .font(.footnote)
+                        .foregroundColor(error ? Color.yellow : Color.white.opacity(0.85))
+                    Button {
+                        if !app.register(name) { error = true }
+                    } label: {
+                        Text("ابدأ").font(.headline).frame(maxWidth: .infinity).padding(14)
+                            .background(Color.white, in: RoundedRectangle(cornerRadius: 14))
+                            .foregroundStyle(Theme.brand)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 30)
+            }
+        }
+    }
+}
+
+// MARK: - القائمة الرئيسية
+
+struct HomeView: View {
+    @EnvironmentObject var app: AppState
+    @State private var showAdd = false
+    @State private var showSettings = false
+
+    private var sorted: [Friend] {
+        app.friends.sorted { (app.last($0.id)?.ts ?? $0.addedAt) > (app.last($1.id)?.ts ?? $1.addedAt) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                if !app.mqttUp {
+                    HStack(spacing: 8) {
+                        ProgressView().scaleEffect(0.8)
+                        Text("جاري الاتصال…").font(.footnote)
+                    }
+                    .frame(maxWidth: .infinity).padding(8)
+                    .background(Color.orange.opacity(0.18))
+                }
+                if app.friends.isEmpty {
+                    emptyState
+                } else {
+                    List {
+                        ForEach(sorted) { f in
+                            NavigationLink(value: f.id) { ChatRow(friend: f) }
+                                .swipeActions {
+                                    Button(role: .destructive) { app.removeFriend(f.id) } label: {
+                                        Label("حذف", systemImage: "trash")
+                                    }
+                                }
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("الشلّة")
+            .navigationDestination(for: String.self) { ChatView(peer: $0) }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button { showSettings = true } label: { Image(systemName: "gearshape.fill") }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { showAdd = true } label: { Image(systemName: "person.badge.plus") }
+                }
+            }
+            .sheet(isPresented: $showAdd) { AddFriendSheet().environmentObject(app).environment(\.layoutDirection, .rightToLeft) }
+            .sheet(isPresented: $showSettings) { SettingsView().environmentObject(app).environment(\.layoutDirection, .rightToLeft) }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Image(systemName: "person.2.fill").font(.system(size: 54)).foregroundStyle(Theme.brand)
+            Text("ما عندك أصدقاء بعد").font(.title3.bold())
+            Text("اطلب من صديقك اسم المستخدم حقه وضيفه.\nاسمك أنت: @\(app.username)")
+                .multilineTextAlignment(.center).foregroundColor(.secondary)
+            Button { showAdd = true } label: {
+                Label("إضافة صديق", systemImage: "person.badge.plus")
+                    .padding(.horizontal, 22).padding(.vertical, 12)
+                    .background(Theme.brand, in: Capsule()).foregroundColor(.white)
+            }
+            Spacer()
+        }
+        .padding()
+    }
+}
+
+struct ChatRow: View {
+    let friend: Friend
+    @EnvironmentObject var app: AppState
+
+    var body: some View {
+        let last = app.last(friend.id)
+        let unread = app.unread(friend.id)
+        HStack(spacing: 12) {
+            Avatar(name: friend.id, size: 52, online: app.online[friend.id] ?? false)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("@" + friend.id).font(.headline)
+                    Spacer()
+                    if let l = last { Text(Fmt.time(l.ts)).font(.caption).foregroundColor(.secondary) }
+                }
+                HStack {
+                    Text(preview(last)).font(.subheadline).foregroundColor(.secondary).lineLimit(1)
+                    Spacer()
+                    if unread > 0 {
+                        Text("\(unread)").font(.caption.bold()).foregroundColor(.white)
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(Theme.brand, in: Capsule())
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func preview(_ m: ChatMessage?) -> String {
+        guard let m else { return "ابدأ المحادثة" }
+        if let b = m.batch { return "📎 " + b.name }
+        return m.text ?? ""
+    }
+}
+
+struct AddFriendSheet: View {
+    @EnvironmentObject var app: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var error = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack {
+                        Text("@").foregroundColor(.secondary)
+                        TextField("اسم المستخدم", text: $name)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .environment(\.layoutDirection, .leftToRight)
+                    }
+                } footer: {
+                    Text(error ? "الاسم غير صحيح" : "اكتب اسم المستخدم اللي أعطاك إياه صديقك.")
+                        .foregroundColor(error ? .red : .secondary)
+                }
+                Section {
+                    Button("إضافة") {
+                        if app.addFriend(name) { dismiss() } else { error = true }
+                    }
+                }
+            }
+            .navigationTitle("إضافة صديق")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .presentationDetents([.medium])
+    }
+}
+
+// MARK: - المحادثة
 
 struct ChatView: View {
+    let peer: String
     @EnvironmentObject var app: AppState
     @State private var text = ""
     @State private var showImporter = false
     @State private var importFolder = false
     @State private var photoItems: [PhotosPickerItem] = []
-    @State private var showSettings = false
+
+    private var msgs: [ChatMessage] { app.chat(peer) }
+    private var isOnline: Bool { app.online[peer] ?? false }
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                PeersBar()
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 10) {
-                            ForEach(app.messages) { m in
-                                MessageRow(m: m).id(m.id)
-                            }
-                        }
-                        .padding(12)
-                    }
-                    .onChange(of: app.messages.count) { _ in
-                        if let last = app.messages.last {
-                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+        VStack(spacing: 0) {
+            statusBanner
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(msgs) { m in
+                            Bubble(m: m).id(m.id)
                         }
                     }
+                    .padding(.horizontal, 12).padding(.vertical, 10)
                 }
-                composer
-            }
-            .navigationTitle("الشلّة")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                }
-            }
-            .sheet(isPresented: $showSettings) {
-                SettingsView(firstRun: false).environmentObject(app)
-                    .environment(\.layoutDirection, .rightToLeft)
-            }
-            .fileImporter(isPresented: $showImporter,
-                          allowedContentTypes: importFolder ? [.folder] : [.item],
-                          allowsMultipleSelection: true) { r in
-                if case .success(let urls) = r { app.startSend(urls: urls) }
-            }
-            .onChange(of: photoItems) { items in
-                guard !items.isEmpty else { return }
-                Task {
-                    var urls: [URL] = []
-                    for it in items {
-                        if let f = try? await it.loadTransferable(type: PickedMedia.self) { urls.append(f.url) }
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: msgs.count) { _ in
+                    app.markRead(peer)
+                    if let last = msgs.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                     }
-                    photoItems = []
-                    app.startSend(urls: urls)
+                }
+                .onAppear {
+                    if let last = msgs.last { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
-            .overlay(alignment: .top) {
-                if let t = app.toast {
-                    Text(t).font(.footnote).padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.top, 8)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+            composer
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 8) {
+                    Avatar(name: peer, size: 32)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("@" + peer).font(.subheadline.bold())
+                        Text(statusText).font(.caption2).foregroundColor(app.isDirect(peer) ? .green : .secondary)
+                    }
                 }
             }
-            .animation(.easeInOut, value: app.toast)
+        }
+        .onAppear { app.activeChat = peer; app.markRead(peer) }
+        .onDisappear { if app.activeChat == peer { app.activeChat = nil } }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: importFolder ? [.folder] : [.item],
+                      allowsMultipleSelection: true) { r in
+            if case .success(let urls) = r { app.startSend(urls: urls, to: peer) }
+        }
+        .onChange(of: photoItems) { items in
+            guard !items.isEmpty else { return }
+            Task {
+                var urls: [URL] = []
+                for it in items {
+                    if let f = try? await it.loadTransferable(type: PickedMedia.self) { urls.append(f.url) }
+                }
+                photoItems = []
+                app.startSend(urls: urls, to: peer)
+            }
+        }
+    }
+
+    private var statusText: String {
+        if app.isDirect(peer) { return "اتصال مباشر ⚡" }
+        return isOnline ? "متصل" : "غير متصل"
+    }
+
+    @ViewBuilder
+    private var statusBanner: some View {
+        if !isOnline {
+            Text("صديقك مو متصل. الرسائل توصله لما يدخل، والملفات تحتاج يكون متصل.")
+                .font(.caption).multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity).padding(8)
+                .background(Color.orange.opacity(0.18))
+        } else if !app.isDirect(peer) {
+            HStack(spacing: 6) {
+                ProgressView().scaleEffect(0.7)
+                Text("جاري تجهيز الاتصال المباشر…").font(.caption)
+            }
+            .frame(maxWidth: .infinity).padding(6)
+            .background(Color.blue.opacity(0.12))
         }
     }
 
@@ -87,17 +347,18 @@ struct ChatView: View {
                     Label("مجلد", systemImage: "folder")
                 }
             } label: {
-                Image(systemName: "paperclip.circle.fill").font(.system(size: 32))
+                Image(systemName: "plus.circle.fill").font(.system(size: 34)).foregroundStyle(Theme.brand)
             }
-            TextField("اكتب رسالة", text: $text, axis: .vertical)
-                .lineLimit(1...4)
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+            TextField("رسالة", text: $text, axis: .vertical)
+                .lineLimit(1...5)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 20))
             Button {
-                app.sendText(text)
+                app.sendText(text, to: peer)
                 text = ""
             } label: {
-                Image(systemName: "arrow.up.circle.fill").font(.system(size: 32))
+                Image(systemName: "arrow.up.circle.fill").font(.system(size: 34))
+                    .foregroundStyle(text.trimmingCharacters(in: .whitespaces).isEmpty ? AnyShapeStyle(Color.gray.opacity(0.4)) : AnyShapeStyle(Theme.brand))
             }
             .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty)
         }
@@ -106,58 +367,37 @@ struct ChatView: View {
     }
 }
 
-struct PeersBar: View {
-    @EnvironmentObject var app: AppState
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                chip("السيرفر", app.serverUp ? .green : .red)
-                ForEach(app.peers.values.sorted { $0.name < $1.name }) { p in
-                    chip(p.name, color(p.state))
-                }
-            }
-            .padding(.horizontal, 12).padding(.vertical, 6)
-        }
-        .background(Color(.systemBackground))
-    }
-    private func color(_ s: String) -> Color {
-        switch s {
-        case "connected": return .green
-        case "failed", "closed": return .red
-        default: return .orange
-        }
-    }
-    private func chip(_ t: String, _ c: Color) -> some View {
-        HStack(spacing: 5) {
-            Circle().fill(c).frame(width: 8, height: 8)
-            Text(t).font(.caption)
-        }
-        .padding(.horizontal, 10).padding(.vertical, 5)
-        .background(Color(.secondarySystemBackground), in: Capsule())
-    }
-}
-
-struct MessageRow: View {
+struct Bubble: View {
     let m: ChatMessage
     var body: some View {
-        // الواجهة RTL: leading = اليمين، ورسائلي تكون يمين
         let mine = m.outgoing
-        VStack(alignment: mine ? .leading : .trailing, spacing: 3) {
-            if !mine {
-                Text(m.name).font(.caption2).foregroundColor(.secondary)
-            }
-            if let b = m.batch {
-                FileCard(m: m, b: b)
-            } else {
-                Text(m.text ?? "")
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(mine ? Color.accentColor : Color(.secondarySystemBackground))
-                    .foregroundColor(mine ? Color.white : Color.primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                    .textSelection(.enabled)
-            }
+        HStack {
+            if mine { content; Spacer(minLength: 44) } else { Spacer(minLength: 44); content }
         }
-        .frame(maxWidth: .infinity, alignment: mine ? .leading : .trailing)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let b = m.batch {
+            FileCard(m: m, b: b)
+        } else {
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(m.text ?? "").textSelection(.enabled)
+                HStack(spacing: 4) {
+                    Text(Fmt.time(m.ts)).font(.system(size: 10))
+                    if m.outgoing {
+                        Image(systemName: m.delivered == true ? "checkmark.circle.fill" : "checkmark.circle")
+                            .font(.system(size: 10))
+                    }
+                }
+                .opacity(0.7)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .foregroundColor(m.outgoing ? Color.white : Color.primary)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(m.outgoing ? AnyShapeStyle(Theme.brand) : AnyShapeStyle(Color(.systemBackground))))
+        }
     }
 }
 
@@ -179,68 +419,94 @@ struct FileCard: View {
 
     private var icon: String {
         switch b.kind {
-        case "video": return "film"
-        case "image": return "photo"
+        case "video": return "film.fill"
+        case "image": return "photo.fill"
         case "folder": return "folder.fill"
         default: return "doc.fill"
         }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: icon).font(.title2).foregroundColor(.accentColor)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Theme.brand).frame(width: 46, height: 46)
+                    .overlay(Image(systemName: icon).foregroundColor(.white).font(.title3))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(b.name).font(.subheadline.weight(.semibold)).lineLimit(2)
                     Text(subtitle).font(.caption).foregroundColor(.secondary)
                 }
             }
             if !done && !failed {
-                ProgressView(value: fraction)
+                bar
                 HStack {
-                    Text("\(Int(fraction * 100))%")
+                    Text("\(Int(fraction * 100))%").bold()
+                    if let s = live?.speed, s > 0 {
+                        Text("• " + Fmt.speed(s))
+                        let remain = Double(b.size - (live?.bytes ?? 0)) / s
+                        let e = Fmt.eta(remain)
+                        if !e.isEmpty { Text("• باقي " + e) }
+                    }
                     Spacer()
-                    if let s = live?.speed, s > 0 { Text(Fmt.size(Int64(s)) + "/ث") }
                 }
                 .font(.caption2).foregroundColor(.secondary)
+                if let n = live?.note, !n.isEmpty {
+                    Text(n).font(.caption2).foregroundColor(.orange)
+                }
             } else if failed {
-                Text(live?.note.isEmpty == false ? live!.note : "ما اكتمل النقل").font(.caption).foregroundColor(.red)
-            } else if let n = live?.note, !n.isEmpty {
-                Text(n).font(.caption).foregroundColor(.orange)
+                Text(live?.note.isEmpty == false ? live!.note : "ما اكتمل النقل")
+                    .font(.caption).foregroundColor(.red)
             }
             if done, !m.outgoing, let url = app.fileURL(for: m) {
                 actions(url)
             }
+            HStack {
+                Spacer()
+                Text(Fmt.time(m.ts)).font(.system(size: 10)).foregroundColor(.secondary)
+            }
         }
         .padding(12)
         .frame(maxWidth: 300, alignment: .leading)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .quickLookPreview($preview)
+    }
+
+    private var bar: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.12))
+                Capsule().fill(Theme.brand).frame(width: max(8, g.size.width * fraction))
+            }
+        }
+        .frame(height: 8)
     }
 
     private var subtitle: String {
         var s = Fmt.size(b.size)
         if b.isFolder { s += " • \(b.count) ملف" }
-        if m.outgoing { s += done ? " • أُرسل" : "" } else { s += done ? " • وصل" : "" }
+        if done { s += m.outgoing ? " • أُرسل ✓" : " • وصل ✓" }
         return s
     }
 
     @ViewBuilder
     private func actions(_ url: URL) -> some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 8) {
             if !b.isFolder {
-                ShareLink(item: url) { Label("مشاركة", systemImage: "square.and.arrow.up") }
-                Button { preview = url } label: { Label("فتح", systemImage: "eye") }
+                ShareLink(item: url) { pill("مشاركة", "square.and.arrow.up") }
+                Button { preview = url } label: { pill("فتح", "eye") }
             }
             if b.kind == "video" || b.kind == "image" {
-                Button { app.saveToPhotos(url, video: b.kind == "video") } label: {
-                    Label("للصور", systemImage: "photo.badge.plus")
-                }
+                Button { app.saveToPhotos(url, video: b.kind == "video") } label: { pill("للصور", "photo.badge.plus") }
             }
-            Button { app.openInFiles(url) } label: { Label("الملفات", systemImage: "folder") }
+            Button { app.openInFiles(url) } label: { pill("الملفات", "folder") }
         }
-        .font(.caption)
-        .labelStyle(.titleAndIcon)
+    }
+
+    private func pill(_ t: String, _ icon: String) -> some View {
+        Label(t, systemImage: icon)
+            .font(.caption)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(Color(.secondarySystemBackground), in: Capsule())
     }
 }
 
@@ -272,7 +538,6 @@ struct PickedMedia: Transferable {
 // MARK: - الإعدادات
 
 struct SettingsView: View {
-    let firstRun: Bool
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var showTurn = false
@@ -280,35 +545,22 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("أنت") {
-                    TextField("اسمك", text: $app.myName)
-                }
                 Section {
-                    TextField("رابط السيرفر (workers.dev)", text: $app.server)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .environment(\.layoutDirection, .leftToRight)
-                    HStack {
-                        TextField("كود الغرفة", text: $app.room)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                            .environment(\.layoutDirection, .leftToRight)
-                        Button("توليد") { app.room = Self.randomCode() }
-                    }
-                } header: {
-                    Text("الغرفة")
-                } footer: {
-                    Text("كل أصدقائك يكتبون نفس الرابط ونفس الكود.")
-                }
-                if !app.room.isEmpty && !app.server.isEmpty {
-                    Section {
-                        ShareLink(item: "الشلّة\nالسيرفر: \(app.server)\nالكود: \(app.room)") {
-                            Label("شارك بيانات الدعوة", systemImage: "person.badge.plus")
+                    HStack(spacing: 12) {
+                        Avatar(name: app.username, size: 48)
+                        VStack(alignment: .leading) {
+                            Text("@" + app.username).font(.headline)
+                            Text(app.mqttUp ? "متصل" : "جاري الاتصال…").font(.caption).foregroundColor(.secondary)
                         }
+                    }
+                    ShareLink(item: "ضيفني في الشلّة: @\(app.username)") {
+                        Label("شارك اسمك مع صديق", systemImage: "square.and.arrow.up")
                     }
                 }
                 Section {
                     Toggle("إبقاء التطبيق شغّال بالخلفية", isOn: $app.keepAlive)
                 } footer: {
-                    Text("iOS يوقف التطبيقات بالخلفية. هذا الخيار يخليه يستقبل ويرسل حتى لو طلعت منه. يستهلك بطارية أكثر.")
+                    Text("iOS يوقف التطبيقات بالخلفية. هذا الخيار يخليك تستقبل وترسل حتى لو طلعت من التطبيق. يستهلك بطارية أكثر.")
                 }
                 Section {
                     DisclosureGroup("خيارات متقدمة (TURN)", isExpanded: $showTurn) {
@@ -320,23 +572,18 @@ struct SettingsView: View {
                         SecureField("كلمة السر", text: $app.turnPass)
                     }
                 } footer: {
-                    Text("تحتاجه فقط لو الاتصال المباشر ما اشتغل بين شبكتين (بعض شبكات الجوال).")
+                    Text("تحتاجه فقط لو الاتصال المباشر ما اشتغل بين شبكتين.")
                 }
                 Section {
-                    Button(firstRun ? "حفظ وابدأ" : "حفظ وإعادة الاتصال") {
-                        app.reconnect()
-                        if !firstRun { dismiss() }
-                    }
-                    .disabled(app.myName.isEmpty || app.room.count < 6 || app.server.isEmpty)
+                    Text("الرسائل مشفّرة، والملفات تنتقل مباشرة من جوالك لجوال صديقك بدون ما تمر على أي سيرفر.")
+                        .font(.footnote).foregroundColor(.secondary)
                 }
             }
-            .navigationTitle(firstRun ? "إعداد الشلّة" : "الإعدادات")
+            .navigationTitle("الإعدادات")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("تم") { dismiss() } }
+            }
         }
-    }
-
-    static func randomCode() -> String {
-        let chars = Array("abcdefghijkmnpqrstuvwxyz23456789")
-        return String((0..<14).map { _ in chars.randomElement()! })
     }
 }

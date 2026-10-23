@@ -111,7 +111,7 @@ struct WelcomeView: View {
                     .resizable().scaledToFit().frame(width: 150, height: 150)
                     .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
                     .shadow(color: Color(hex: 0x3B6BF7).opacity(0.5), radius: 30, y: 10)
-                Text("الشلّة").font(.system(size: 42, weight: .heavy, design: .rounded)).foregroundColor(.white)
+                Text("TextVast").font(.system(size: 42, weight: .heavy, design: .rounded)).foregroundColor(.white)
                 Text("محادثات أفضل، أصدقاء أقرب")
                     .foregroundColor(Theme.text2)
                 Spacer()
@@ -220,7 +220,7 @@ struct ChatsTab: View {
                 }
             }
             .background(Theme.bg.ignoresSafeArea())
-            .navigationTitle("الشلّة")
+            .navigationTitle("TextVast")
             .navigationDestination(for: String.self) { ChatView(peer: $0) }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -495,7 +495,7 @@ struct SettingsTab: View {
                         in: RoundedRectangle(cornerRadius: 22, style: .continuous))
 
                     VStack(spacing: 0) {
-                        ShareLink(item: "ضيفني في الشلّة: @\(app.username)") {
+                        ShareLink(item: "ضيفني في TextVast: @\(app.username)") {
                             row("square.and.arrow.up", 0x3B6BF7, "شارك اسمك مع صديق")
                         }
                         divider

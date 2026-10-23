@@ -412,10 +412,23 @@ final class AppState: ObservableObject {
         return links[peer]?.isConnected == true
     }
 
+    /// ننتظر لين الصديق يدخل (بدون حد). الملف يظهر في الشات بحالة انتظار.
+    private func waitOnline(_ peer: String, _ bid: String) async {
+        guard online[peer] != true else { return }
+        var st = progress[bid] ?? TransferState()
+        st.note = "بانتظار دخول @\(peer)… خلّ التطبيق مفتوح"
+        progress[bid] = st
+        while online[peer] != true {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        st = progress[bid] ?? TransferState()
+        st.note = ""
+        progress[bid] = st
+    }
+
     private func runSend(_ urls: [URL], _ peer: String) async {
         if online[peer] != true && links[peer]?.isConnected != true {
-            showToast("\(peer) مو متصل الحين")
-            return
+            showToast("@\(peer) مو متصل. الملف بيوصله أول ما يدخل التطبيق")
         }
         for url in urls {
             let scoped = url.startAccessingSecurityScopedResource()
@@ -454,6 +467,7 @@ final class AppState: ObservableObject {
                 var ok = false
                 var attempt = 0
                 while attempt < 6 && !ok {
+                    await waitOnline(peer, bid)
                     attempt += 1
                     let connected = await waitConnected(peer, timeout: attempt == 1 ? 20 : 120)
                     guard connected, let link = links[peer] else {

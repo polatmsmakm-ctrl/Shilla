@@ -4,6 +4,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -15,11 +18,20 @@ jobs:
         run: xcodegen generate
       - name: Build (unsigned)
         run: |
+          set -o pipefail
           xcodebuild -project Shilla.xcodeproj -scheme Shilla \
             -configuration Release -sdk iphoneos \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build
+            build 2>&1 | tee build.log
+      - name: Publish build log
+        if: always()
+        run: |
+          mkdir -p /tmp/blog
+          { echo "== xcodebuild -list =="; xcodebuild -list -project Shilla.xcodeproj 2>&1 | head -40; echo; echo "== errors =="; grep -nE "error:|fatal|FAILED|Could not|cannot" build.log | head -60; echo; echo "== tail =="; tail -80 build.log; } > /tmp/blog/build-log.txt 2>&1 || true
+          cd /tmp/blog && git init -q && git checkout -q -b buildlog
+          git -c user.name=ci -c user.email=ci@example.com add . && git -c user.name=ci -c user.email=ci@example.com commit -qm log
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" buildlog
       - name: Package IPA
         run: |
           mkdir -p Payload

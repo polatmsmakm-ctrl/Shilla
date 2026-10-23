@@ -12,7 +12,7 @@ struct ShillaApp: App {
             }
             .environmentObject(app)
             .environment(\.layoutDirection, .rightToLeft)
-            .tint(Color(red: 0.40, green: 0.36, blue: 0.98))
+            .tint(Theme.accent)
             .overlay(alignment: .top) {
                 if let t = app.toast {
                     Text(t).font(.footnote).padding(.horizontal, 14).padding(.vertical, 8)

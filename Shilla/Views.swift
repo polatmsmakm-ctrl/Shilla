@@ -7,17 +7,25 @@ import UniformTypeIdentifiers
 
 enum Theme {
     static let brand = LinearGradient(
-        colors: [Color(red: 0.30, green: 0.42, blue: 1.0), Color(red: 0.60, green: 0.30, blue: 0.96)],
+        colors: [Color(red: 0.07, green: 0.80, blue: 0.68), Color(red: 0.04, green: 0.45, blue: 0.94)],
         startPoint: .topLeading, endPoint: .bottomTrailing)
+
+    static let accent = Color(red: 0.05, green: 0.62, blue: 0.80)
+
+    private static let avatarPairs: [(Color, Color)] = [
+        (Color(red: 1.00, green: 0.62, blue: 0.20), Color(red: 0.96, green: 0.38, blue: 0.20)),
+        (Color(red: 0.98, green: 0.45, blue: 0.45), Color(red: 0.90, green: 0.26, blue: 0.36)),
+        (Color(red: 0.30, green: 0.83, blue: 0.52), Color(red: 0.10, green: 0.62, blue: 0.45)),
+        (Color(red: 0.20, green: 0.82, blue: 0.80), Color(red: 0.05, green: 0.58, blue: 0.70)),
+        (Color(red: 0.36, green: 0.70, blue: 1.00), Color(red: 0.10, green: 0.45, blue: 0.90)),
+        (Color(red: 1.00, green: 0.78, blue: 0.25), Color(red: 0.95, green: 0.58, blue: 0.10)),
+    ]
 
     static func avatar(_ name: String) -> LinearGradient {
         var h = 0
         for s in name.unicodeScalars { h = (h &* 31 &+ Int(s.value)) & 0xFFFF }
-        let hue = Double(h % 360) / 360
-        return LinearGradient(
-            colors: [Color(hue: hue, saturation: 0.55, brightness: 0.96),
-                     Color(hue: (hue + 0.08).truncatingRemainder(dividingBy: 1), saturation: 0.75, brightness: 0.78)],
-            startPoint: .top, endPoint: .bottom)
+        let p = avatarPairs[h % avatarPairs.count]
+        return LinearGradient(colors: [p.0, p.1], startPoint: .top, endPoint: .bottom)
     }
 }
 
@@ -52,6 +60,13 @@ struct WelcomeView: View {
     var body: some View {
         ZStack {
             Theme.brand.ignoresSafeArea()
+            GeometryReader { g in
+                Circle().fill(Color.white.opacity(0.10)).frame(width: g.size.width * 0.9)
+                    .offset(x: -g.size.width * 0.35, y: -g.size.width * 0.35)
+                Circle().fill(Color.white.opacity(0.08)).frame(width: g.size.width * 1.1)
+                    .offset(x: g.size.width * 0.35, y: g.size.height * 0.62)
+            }
+            .ignoresSafeArea()
             VStack(spacing: 22) {
                 Spacer()
                 RoundedRectangle(cornerRadius: 28, style: .continuous)
@@ -397,6 +412,7 @@ struct Bubble: View {
             .background(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(m.outgoing ? AnyShapeStyle(Theme.brand) : AnyShapeStyle(Color(.systemBackground))))
+            .shadow(color: .black.opacity(m.outgoing ? 0 : 0.05), radius: 3, y: 1)
         }
     }
 }
@@ -468,6 +484,7 @@ struct FileCard: View {
         .padding(12)
         .frame(maxWidth: 300, alignment: .leading)
         .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .shadow(color: .black.opacity(0.06), radius: 5, y: 2)
         .quickLookPreview($preview)
     }
 

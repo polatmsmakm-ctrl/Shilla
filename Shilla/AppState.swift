@@ -13,6 +13,7 @@ struct FileItem {
 final class AppState: ObservableObject {
     // الهوية والإعدادات
     @Published var username: String { didSet { UserDefaults.standard.set(username, forKey: "username") } }
+    @Published var relayURL: String { didSet { UserDefaults.standard.set(relayURL, forKey: "relayURL") } }
     @Published var turnURL: String { didSet { UserDefaults.standard.set(turnURL, forKey: "turnURL") } }
     @Published var turnUser: String { didSet { UserDefaults.standard.set(turnUser, forKey: "turnUser") } }
     @Published var turnPass: String { didSet { UserDefaults.standard.set(turnPass, forKey: "turnPass") } }
@@ -50,6 +51,7 @@ final class AppState: ObservableObject {
             d.set(deviceId, forKey: "did")
         }
         username = d.string(forKey: "username") ?? ""
+        relayURL = d.string(forKey: "relayURL") ?? ""
         turnURL = d.string(forKey: "turnURL") ?? ""
         turnUser = d.string(forKey: "turnUser") ?? ""
         turnPass = d.string(forKey: "turnPass") ?? ""
@@ -92,6 +94,7 @@ final class AppState: ObservableObject {
         mqtt.subscribe(inbox(username))
         for f in friends { mqtt.subscribe(presence(f.id)) }
         mqtt.publish(topic: presence(username), payload: Data("1".utf8), retain: true)
+        resumeCloudDownloads()
     }
 
     private func mqttMessage(_ topic: String, _ data: Data) {
@@ -153,6 +156,21 @@ final class AppState: ObservableObject {
             if let sdp = d["sdp"] as? String { links[from]?.handleAnswer(sdp) }
         case "ice":
             links[from]?.handleIce(d)
+        case "cloud":
+            guard let bid = d["bid"] as? String, let mk = d["mk"] as? String,
+                  let name = d["bname"] as? String else { return }
+            guard !messages.contains(where: { $0.id == bid }) else { return }
+            addFriendIfNeeded(from)
+            let b = BatchInfo(bid: bid, name: name, size: (d["bsize"] as? NSNumber)?.int64Value ?? 0,
+                              count: (d["bcount"] as? NSNumber)?.intValue ?? 1,
+                              isFolder: (d["folder"] as? NSNumber)?.boolValue ?? false,
+                              kind: d["kind"] as? String ?? "file")
+            appendMessage(ChatMessage(id: bid, peer: from, ts: Date().timeIntervalSince1970, text: nil,
+                                      batch: b, outgoing: false, localRel: nil, status: "active", delivered: nil))
+            savePending(bid, from: from, mk: mk)
+            progress[bid] = TransferState()
+            refreshActivity()
+            Task { await cloudReceive(bid: bid, from: from, mk: mk) }
         case "want":
             addFriendIfNeeded(from)
             makeLink(from, initiator: true)
@@ -454,6 +472,11 @@ final class AppState: ObservableObject {
             progress[bid] = TransferState()
             refreshActivity()
 
+            if online[peer] != true, links[peer]?.isConnected != true, Relay.configured {
+                await cloudSend(listing: listing, bid: bid, batch: batch, peer: peer)
+                continue
+            }
+
             var base: Int64 = 0
             var doneFiles = 0
             var failedAll = false
@@ -531,6 +554,142 @@ final class AppState: ObservableObject {
         }
         out.sort { $0.rel < $1.rel }
         return (true, out)
+    }
+
+    // MARK: الوسيط السحابي
+
+    private func cloudSend(listing: (isFolder: Bool, files: [FileItem]), bid: String, batch: BatchInfo, peer: String) async {
+        var st = progress[bid] ?? TransferState()
+        st.note = "جاري الرفع للخدمة، وصديقك ينزّله لما يدخل"
+        progress[bid] = st
+        var base: Int64 = 0
+        var manifest: [[String: Any]] = []
+        do {
+            for (i, f) in listing.files.enumerated() {
+                let key = "\(bid)/\(i)"
+                let b0 = base
+                try await Relay.upload(url: f.url, size: f.size, key: key) { cur in
+                    Task { @MainActor in self.setBytes(bid, b0 + cur) }
+                }
+                manifest.append(["rel": f.rel, "size": f.size, "k": key])
+                base += f.size
+            }
+            let md = try JSONSerialization.data(withJSONObject: manifest)
+            try await Relay.put(key: "\(bid)/manifest", data: md)
+            sendTo(peer, ["t": "cloud", "bid": bid, "mk": "\(bid)/manifest", "bname": batch.name,
+                          "bsize": batch.size, "bcount": batch.count, "folder": batch.isFolder, "kind": batch.kind])
+            var s2 = progress[bid] ?? TransferState()
+            s2.note = ""
+            progress[bid] = s2
+            setBytes(bid, base, force: true)
+            finish(bid, ok: true)
+        } catch {
+            finish(bid, ok: false, note: "فشل الرفع: \(error.localizedDescription). أعد الإرسال.")
+        }
+    }
+
+    private func savePending(_ bid: String, from: String, mk: String) {
+        var p = UserDefaults.standard.dictionary(forKey: "pendingCloud") as? [String: [String]] ?? [:]
+        p[bid] = [from, mk]
+        UserDefaults.standard.set(p, forKey: "pendingCloud")
+    }
+
+    private func clearPending(_ bid: String) {
+        var p = UserDefaults.standard.dictionary(forKey: "pendingCloud") as? [String: [String]] ?? [:]
+        p[bid] = nil
+        UserDefaults.standard.set(p, forKey: "pendingCloud")
+    }
+
+    /// لو التطبيق انقفل أثناء تنزيل من الوسيط نكمله.
+    func resumeCloudDownloads() {
+        let p = UserDefaults.standard.dictionary(forKey: "pendingCloud") as? [String: [String]] ?? [:]
+        for (bid, v) in p where v.count == 2 {
+            guard progress[bid] == nil, let i = messages.firstIndex(where: { $0.id == bid }) else {
+                if messages.first(where: { $0.id == bid }) == nil { clearPending(bid) }
+                continue
+            }
+            messages[i].status = "active"
+            progress[bid] = TransferState()
+            let from = v[0], mk = v[1]
+            Task { await cloudReceive(bid: bid, from: from, mk: mk) }
+        }
+        refreshActivity()
+    }
+
+    private func cloudReceive(bid: String, from: String, mk: String) async {
+        let fm = FileManager.default
+        var attempt = 0
+        while attempt < 8 {
+            attempt += 1
+            do {
+                let md = try await Relay.getData(key: mk)
+                guard let arr = try JSONSerialization.jsonObject(with: md) as? [[String: Any]] else {
+                    throw Relay.Fail(msg: "قائمة الملفات تالفة")
+                }
+                var base: Int64 = 0
+                var top = ""
+                for f in arr {
+                    guard let rel = f["rel"] as? String, let k = f["k"] as? String,
+                          let size = (f["size"] as? NSNumber)?.int64Value else { continue }
+                    let comps = rel.split(separator: "/").map(String.init).filter { $0 != "." && $0 != ".." && !$0.isEmpty }
+                    guard !comps.isEmpty else { continue }
+                    var dest = Paths.received
+                    for c in comps { dest.appendPathComponent(c) }
+                    try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    var finalURL = dest
+                    if fm.fileExists(atPath: dest.path) {
+                        let ex = (try? fm.attributesOfItem(atPath: dest.path)[.size] as? NSNumber)?.int64Value ?? -1
+                        if ex == size {
+                            if top.isEmpty { top = comps[0] }
+                            base += size
+                            continue
+                        }
+                        finalURL = Self.uniqueURL(dest)
+                    }
+                    if top.isEmpty { top = comps.count == 1 ? finalURL.lastPathComponent : comps[0] }
+                    let part = finalURL.appendingPathExtension("part")
+                    let b0 = base
+                    try await Relay.download(key: k, to: part, total: size) { cur in
+                        Task { @MainActor in self.setBytes(bid, b0 + cur) }
+                    }
+                    try? fm.removeItem(at: finalURL)
+                    try fm.moveItem(at: part, to: finalURL)
+                    base += size
+                }
+                if let i = messages.firstIndex(where: { $0.id == bid }) { messages[i].localRel = "Received/" + top }
+                var st = progress[bid] ?? TransferState()
+                st.note = ""
+                progress[bid] = st
+                setBytes(bid, base, force: true)
+                finish(bid, ok: true)
+                clearPending(bid)
+                if activeChat == from { markRead(from) }
+                notify(from, "وصلك: " + (messages.first { $0.id == bid }?.batch?.name ?? "ملف"))
+                for f in arr { if let k = f["k"] as? String { await Relay.delete(key: k) } }
+                await Relay.delete(key: mk)
+                return
+            } catch {
+                var st = progress[bid] ?? TransferState()
+                st.note = "انقطع التحميل، جاري إعادة المحاولة…"
+                progress[bid] = st
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 4_000_000_000)
+            }
+        }
+        finish(bid, ok: false, note: "ما قدرت أنزّله. افتح التطبيق مرة ثانية وبيكمل.")
+    }
+
+    private nonisolated static func uniqueURL(_ url: URL) -> URL {
+        let fm = FileManager.default
+        let dir = url.deletingLastPathComponent()
+        let ext = url.pathExtension
+        let base = url.deletingPathExtension().lastPathComponent
+        var n = 2
+        while true {
+            let name = ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)"
+            let c = dir.appendingPathComponent(name)
+            if !fm.fileExists(atPath: c.path) { return c }
+            n += 1
+        }
     }
 
     // MARK: أدوات

@@ -529,6 +529,7 @@ struct SettingsTab: View {
                         }
                         if showTurn {
                             VStack(spacing: 10) {
+                                field("https://relay.xxx.workers.dev", $app.relayURL)
                                 field("turn:host:3478", $app.turnURL)
                                 field("المستخدم", $app.turnUser)
                                 SecureField("", text: $app.turnPass, prompt: Text("كلمة السر").foregroundColor(Theme.text2))
@@ -682,7 +683,7 @@ struct ChatView: View {
     @ViewBuilder
     private var statusBanner: some View {
         if !isOnline {
-            Text("صديقك مو متصل. الرسائل توصله لما يدخل، والملفات تحتاج يكون متصل.")
+            Text(Relay.configured ? "صديقك مو متصل. الرسائل والملفات توصله لما يدخل." : "صديقك مو متصل. الرسائل توصله لما يدخل، والملفات تحتاج يكون متصل.")
                 .font(.caption).foregroundColor(.white).multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity).padding(8)
                 .background(Color(hex: 0xF07A2A).opacity(0.28))

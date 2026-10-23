@@ -250,6 +250,12 @@ final class AppState: ObservableObject {
         return messages.filter { $0.peer == peer && !$0.outgoing && $0.ts > lr }.count
     }
 
+    var totalUnread: Int { friends.reduce(0) { $0 + unread($1.id) } }
+
+    var fileMessages: [ChatMessage] {
+        messages.filter { $0.batch != nil }.sorted { $0.ts > $1.ts }
+    }
+
     func markRead(_ peer: String) {
         lastRead[peer] = Date().timeIntervalSince1970 + 1
         if let d = try? JSONEncoder().encode(lastRead) { UserDefaults.standard.set(d, forKey: "lastRead") }

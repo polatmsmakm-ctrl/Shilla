@@ -10,7 +10,7 @@ final class DocPicker: NSObject, UIDocumentPickerDelegate {
     func present(folder: Bool, completion: @escaping ([URL]) -> Void) {
         self.completion = completion
         let types: [UTType] = folder ? [.folder] : [.item]
-        let p = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
+        let p = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
         p.allowsMultipleSelection = !folder
         p.delegate = self
         top()?.present(p, animated: true)

@@ -670,7 +670,7 @@ struct ChatView: View {
         // نعرض الاختيار فوق نافذة الإرفاق نفسها (بدون ما نسكّرها قبل) عشان ما يتعارض العرضين
         DocPicker.shared.present(folder: folder) { urls in
             showAttach = false
-            app.startSend(urls: urls, to: peer)
+            app.startSend(urls: urls.map { Self.keep($0) }, to: peer)
         }
     }
 

@@ -596,6 +596,7 @@ struct ChatView: View {
     @State private var text = ""
     @State private var showAttach = false
     @State private var photoItems: [PhotosPickerItem] = []
+    @State private var preparing = 0
 
     private var msgs: [ChatMessage] { app.chat(peer) }
     private var isOnline: Bool { app.online[peer] ?? false }
@@ -648,13 +649,20 @@ struct ChatView: View {
         .onChange(of: photoItems) { items in
             guard !items.isEmpty else { return }
             showAttach = false
+            preparing = items.count
+            photoItems = []
             Task {
-                var urls: [URL] = []
+                // نجهز كل عنصر ونرسله أول ما يجهز (بدون ما ننتظر الباقي)
+                var failed = 0
                 for it in items {
-                    if let f = try? await it.loadTransferable(type: PickedMedia.self) { urls.append(Self.keep(f.url)) }
+                    if let f = try? await it.loadTransferable(type: PickedMedia.self) {
+                        app.startSend(urls: [Self.keep(f.url)], to: peer)
+                    } else {
+                        failed += 1
+                    }
+                    preparing = max(0, preparing - 1)
                 }
-                photoItems = []
-                app.startSend(urls: urls, to: peer)
+                if failed > 0 { app.showToast("ما قدرت أجهز \(failed) من العناصر") }
             }
         }
     }
@@ -676,12 +684,23 @@ struct ChatView: View {
     }
 
     private var statusText: String {
-        if app.isDirect(peer) { return "متصل • اتصال مباشر ⚡" }
+        if app.isDirect(peer) {
+            let n = app.lanes[peer] ?? 0
+            return n > 1 ? "اتصال مباشر ⚡ \(n)/\(kLanes)" : "متصل • اتصال مباشر ⚡"
+        }
         return isOnline ? "متصل" : "غير متصل"
     }
 
     @ViewBuilder
     private var statusBanner: some View {
+        if preparing > 0 {
+            HStack(spacing: 6) {
+                ProgressView().scaleEffect(0.7).tint(.white)
+                Text("جاري تجهيز \(preparing) من الصور/الفيديو بالجودة الأصلية…").font(.caption).foregroundColor(.white)
+            }
+            .frame(maxWidth: .infinity).padding(6)
+            .background(Color(hex: 0x7A3CF0).opacity(0.30))
+        }
         if !isOnline {
             Text(Relay.configured ? "صديقك مو متصل. الرسائل والملفات توصله لما يدخل." : "صديقك مو متصل. الرسائل توصله لما يدخل، والملفات تحتاج يكون متصل.")
                 .font(.caption).foregroundColor(.white).multilineTextAlignment(.center)
@@ -770,10 +789,22 @@ struct AttachSheet: View {
 
 struct Bubble: View {
     let m: ChatMessage
+    @EnvironmentObject var app: AppState
     var body: some View {
         let mine = m.outgoing
         HStack {
-            if mine { content; Spacer(minLength: 44) } else { Spacer(minLength: 44); content }
+            if mine { menuContent; Spacer(minLength: 44) } else { Spacer(minLength: 44); menuContent }
+        }
+    }
+
+    private var menuContent: some View {
+        content.contextMenu {
+            if let t = m.text {
+                Button { UIPasteboard.general.string = t } label: { Label("نسخ", systemImage: "doc.on.doc") }
+            }
+            Button(role: .destructive) { app.deleteMessage(m.id) } label: {
+                Label(m.batch == nil ? "حذف الرسالة" : "حذف من المحادثة", systemImage: "trash")
+            }
         }
     }
 
@@ -810,10 +841,11 @@ struct FileCard: View {
     var fill = false
     @EnvironmentObject var app: AppState
     @State private var preview: URL?
+    @State private var confirmCancel = false
 
     private var live: TransferState? { app.progress[m.id] }
     private var done: Bool { live?.finished ?? (m.status == "done") }
-    private var failed: Bool { live?.failed ?? (m.status == "failed") }
+    private var failed: Bool { live?.failed ?? (m.status == "failed" || m.status == "cancelled") }
     private var fraction: Double {
         if let l = live { return min(1, Double(l.bytes) / Double(max(1, b.size))) }
         return done ? 1 : 0
@@ -849,15 +881,30 @@ struct FileCard: View {
                         let e = Fmt.eta(remain)
                         if !e.isEmpty { Text("• باقي " + e) }
                     }
+                    if b.isFolder, let f = live?.files, f > 0 {
+                        Text("• \(f)/\(b.count)")
+                    }
                     Spacer()
+                    Button { confirmCancel = true } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 20))
+                            .foregroundColor(Color.white.opacity(0.55))
+                    }
+                    .buttonStyle(.plain)
                 }
                 .font(.caption2).foregroundColor(Theme.text2)
                 if let n = live?.note, !n.isEmpty {
                     Text(n).font(.caption2).foregroundColor(Color(hex: 0xFFB45C))
                 }
             } else if failed {
-                Text(live?.note.isEmpty == false ? live!.note : "ما اكتمل النقل")
-                    .font(.caption).foregroundColor(Color(hex: 0xFF6B6B))
+                HStack {
+                    Text(live?.note.isEmpty == false ? live!.note : (m.status == "cancelled" ? "أُلغي النقل" : "ما اكتمل النقل"))
+                        .font(.caption).foregroundColor(Color(hex: 0xFF6B6B))
+                    Spacer()
+                    if m.outgoing {
+                        Button { app.retrySend(m) } label: { pill("أعد الإرسال", "arrow.clockwise") }
+                            .buttonStyle(.plain)
+                    }
+                }
             }
             if done || m.outgoing, let url = app.fileURL(for: m) {
                 actions(url)
@@ -871,6 +918,10 @@ struct FileCard: View {
         .frame(maxWidth: fill ? .infinity : 300, alignment: .leading)
         .background(Theme.surface2, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .quickLookPreview($preview)
+        .confirmationDialog("إلغاء النقل؟", isPresented: $confirmCancel, titleVisibility: .visible) {
+            Button("إلغاء النقل", role: .destructive) { app.cancelTransfer(m.id) }
+            Button("متابعة", role: .cancel) {}
+        }
     }
 
     private var bar: some View {
@@ -886,7 +937,10 @@ struct FileCard: View {
     private var subtitle: String {
         var s = Fmt.size(b.size)
         if b.isFolder { s += " • \(b.count) ملف" }
-        if done { s += m.outgoing ? " • أُرسل ✓" : " • وصل ✓" }
+        if done {
+            s += m.outgoing ? " • أُرسل ✓" : " • وصل ✓"
+            if let a = live?.avg, a > 0 { s += " • " + Fmt.speed(a) }
+        }
         return s
     }
 

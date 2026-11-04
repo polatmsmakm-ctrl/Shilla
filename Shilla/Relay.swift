@@ -42,7 +42,9 @@ enum Relay {
     private static func retry<T>(_ n: Int = 5, _ op: () async throws -> T) async throws -> T {
         var last: Error = Fail(msg: "فشل")
         for i in 0..<n {
+            try Task.checkCancellation()
             do { return try await op() } catch {
+                if Task.isCancelled { throw error }
                 last = error
                 try? await Task.sleep(nanoseconds: UInt64(1_000_000_000 * (i + 1)))
             }

@@ -33,6 +33,11 @@ struct TransferState: Hashable {
     var finished = false
     var failed = false
     var note = ""
+    /// وقت أول بايت ومن وين بدينا (لحساب متوسط السرعة)
+    var started: Date? = nil
+    var startBytes: Int64 = 0
+    /// متوسط السرعة بعد ما يخلص
+    var avg: Double = 0
 }
 
 struct FileMeta {

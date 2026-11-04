@@ -22,6 +22,7 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     let lid: String
     let created = Date()
     var onState: ((String) -> Void)?
+    var onLanes: ((Int) -> Void)?
 
     private var pcs: [RTCPeerConnection] = []
     private var ctls: [RTCDataChannel] = []
@@ -189,7 +190,8 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
         guard let i = lane(of: peerConnection) else { return }
         let up = (newState == .connected || newState == .completed)
-        lock.lock(); laneUp[i] = up; lock.unlock()
+        lock.lock(); laneUp[i] = up; let n = laneUp.filter { $0 }.count; lock.unlock()
+        onLanes?(n)
         // حالة الاتصال كله = حالة الحارة 0 (عليها قناة التحكم)
         guard i == 0 else { return }
         let s: String

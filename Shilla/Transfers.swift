@@ -74,6 +74,9 @@ final class IncomingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
         if meta != nil { persistWatermark() }
         try? handle?.close()
         handle = nil
+        // نسكّر كل القنوات حتى المُرسِل يدري فوراً ويعيد المحاولة من علامة التقدّم
+        lock.lock(); let cs = chans; lock.unlock()
+        cs.forEach { $0.close() }
         if let m = meta { ev.onFail(m, from) }
         onClosed?()
     }

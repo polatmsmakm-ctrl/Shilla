@@ -206,23 +206,39 @@ final class AppState: ObservableObject {
             guard let sdp = d["sdp"] as? String else { return }
             let lid = d["lid"] as? String ?? ""
             let ln = (d["ln"] as? NSNumber)?.intValue ?? 0
+            let lts = (d["lts"] as? NSNumber)?.doubleValue ?? 0
             addFriendIfNeeded(from)
             if let l = links[from], l.lid == lid, !l.initiator {
                 // حارة إضافية لنفس الاتصال
                 l.handleOffer(lane: ln, sdp)
                 return
             }
+            // عرض من اتصال قديم (توصل الرسائل بترتيب مختلف من السيرفرات): نتجاهله
+            if retiredLids.contains(lid) { return }
+            if let cur = linkTs[from], lts > 0, lts < cur { return }
             // لو الاثنين عرضوا بنفس الوقت: اللي اسمه أكبر هو اللي يكمل
             if let l = links[from], l.initiator, !l.hasRemote, username > from { return }
             makeLink(from, initiator: false, lid: lid)
+            if lts > 0 { linkTs[from] = lts }
             links[from]?.handleOffer(lane: ln, sdp)
+            // نطبق أي مرشحات وصلت قبل العرض
+            if let early = earlyIce.removeValue(forKey: lid) {
+                for (eln, ed) in early { links[from]?.handleIce(lane: eln, ed) }
+            }
         case "answer":
             // نتجاهل أي رد من اتصال قديم
             guard let sdp = d["sdp"] as? String, let l = links[from], l.lid == (d["lid"] as? String ?? "") else { return }
             l.handleAnswer(lane: (d["ln"] as? NSNumber)?.intValue ?? 0, sdp)
         case "ice":
-            guard let l = links[from], l.lid == (d["lid"] as? String ?? "") else { return }
-            l.handleIce(lane: (d["ln"] as? NSNumber)?.intValue ?? 0, d)
+            let lid = d["lid"] as? String ?? ""
+            let ln = (d["ln"] as? NSNumber)?.intValue ?? 0
+            if let l = links[from], l.lid == lid {
+                l.handleIce(lane: ln, d)
+            } else if !retiredLids.contains(lid), !lid.isEmpty {
+                // وصل قبل العرض: نخزنه شوي
+                if earlyIce.count > 8 { earlyIce.removeAll() }
+                earlyIce[lid, default: []].append((ln, SendableMeta(d).value))
+            }
         case "cloud":
             guard let bid = d["bid"] as? String, let mk = d["mk"] as? String,
                   let name = d["bname"] as? String else { return }
@@ -248,6 +264,9 @@ final class AppState: ObservableObject {
             }
         case "want":
             addFriendIfNeeded(from)
+            // لو عندنا اتصال شغال أو قاعد يتجهز من أقل من 10 ثواني، ما نهدمه
+            if let l = links[from], l.initiator,
+               l.isConnected || (l.state == "connecting" && Date().timeIntervalSince(l.created) < 10) { return }
             makeLink(from, initiator: true)
         default: break
         }
@@ -290,7 +309,12 @@ final class AppState: ObservableObject {
     }
 
     private func makeLink(_ u: String, initiator: Bool, lid: String = UUID().uuidString) {
-        links[u]?.close()
+        if let old = links[u] {
+            retiredLids.insert(old.lid)
+            if retiredLids.count > 200 { retiredLids.removeAll() }
+            old.close()
+        }
+        if initiator { linkTs[u] = nil }
         let link = PeerLink(
             peerId: u,
             initiator: initiator,
@@ -494,6 +518,8 @@ final class AppState: ObservableObject {
 
     private func recvFinish(_ meta: FileMeta, _ from: String, _ top: String) {
         recvLive[meta.bid]?[meta.rel] = nil
+        // ملف وصل من قبل (إعادة إرسال للمجلد كامل): ما نعدّه مرة ثانية
+        guard recvDone[meta.bid, default: []].insert(meta.rel).inserted else { return }
         recvBase[meta.bid, default: 0] += meta.size
         recvCount[meta.bid, default: 0] += 1
         let count = recvCount[meta.bid] ?? 0
@@ -526,6 +552,11 @@ final class AppState: ObservableObject {
     }
 
     private var lastRequest: [String: Date] = [:]
+    private var retiredLids = Set<String>()
+    private var linkTs: [String: Double] = [:]
+    private var earlyIce: [String: [(Int, [String: Any])]] = [:]
+    /// الملفات اللي وصلت كاملة في كل دفعة (حتى ما ننحسب مرتين عند إعادة الإرسال)
+    private var recvDone: [String: Set<String>] = [:]
     private var sendTasks: [String: Task<Void, Never>] = [:]
     private var cancelled = Set<String>()
 
@@ -681,18 +712,18 @@ final class AppState: ObservableObject {
         lastSample[m.id] = nil
         refreshActivity()
         let peer = m.peer
-        Task {
+        let bid = m.id
+        // المهمة تتسجل فوراً حتى أي إلغاء يوصل الحين يوقفها
+        sendTasks[bid] = Task {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             let listing = Self.listFiles(url)
-            guard !listing.files.isEmpty else {
-                finish(m.id, ok: false, note: "الملف الأصلي انحذف")
-                return
+            if listing.files.isEmpty {
+                self.finish(bid, ok: false, note: "الملف الأصلي انحذف")
+            } else if !Task.isCancelled {
+                await self.transferBatch(listing: listing, bid: bid, batch: b, peer: peer)
             }
-            let t = Task { await self.transferBatch(listing: listing, bid: m.id, batch: b, peer: peer) }
-            sendTasks[m.id] = t
-            await t.value
-            sendTasks[m.id] = nil
+            self.sendTasks[bid] = nil
         }
     }
 
@@ -737,7 +768,7 @@ final class AppState: ObservableObject {
                          onBytes: @escaping @MainActor (Int64) -> Void) async -> Bool {
         var attempt = 0
         while attempt < 8 {
-            if Task.isCancelled { return false }
+            if Task.isCancelled || cancelled.contains(bid) { return false }
             await waitOnline(peer, bid)
             if Task.isCancelled { return false }
             attempt += 1

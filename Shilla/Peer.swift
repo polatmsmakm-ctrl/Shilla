@@ -90,7 +90,8 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
             pc.offer(for: constraints) { [weak self] sdp, _ in
                 guard let self, let sdp else { return }
                 pc.setLocalDescription(sdp) { _ in
-                    self.sendSignal(["t": "offer", "sdp": sdp.sdp, "ln": i, "lid": self.lid])
+                    self.sendSignal(["t": "offer", "sdp": sdp.sdp, "ln": i, "lid": self.lid,
+                                     "lts": self.created.timeIntervalSince1970])
                 }
             }
         }
@@ -146,6 +147,7 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
                   onProgress: @escaping (Int64) -> Void) async throws {
         let tid = UUID().uuidString
         var dcs: [RTCDataChannel] = []
+        var lanesUsed: [Int] = []
         lock.lock(); let up = laneUp; lock.unlock()
         // القناة رقم 0 (التحكم) دائماً على الحارة 0، والباقي على كل حارة شغالة
         for (i, pc) in pcs.enumerated() where i == 0 || up[i] {
@@ -155,8 +157,18 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
                 if i == 0 { throw TErr.closed } else { continue }
             }
             dcs.append(dc)
+            lanesUsed.append(i)
         }
         let out = OutgoingFile(dcs: dcs)
+        let laneOfChannel = lanesUsed
+        out.laneOK = { [weak self] k in
+            guard let self, k < laneOfChannel.count else { return true }
+            let ln = laneOfChannel[k]
+            // الحارة 0 دايماً (عليها التحكم)، الباقي لازم يكون متصل
+            if ln == 0 { return true }
+            self.lock.lock(); defer { self.lock.unlock() }
+            return self.laneUp[ln]
+        }
         let key = ObjectIdentifier(out)
         lock.lock(); outs[key] = out; lock.unlock()
         defer {
@@ -192,6 +204,15 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
         let up = (newState == .connected || newState == .completed)
         lock.lock(); laneUp[i] = up; let n = laneUp.filter { $0 }.count; lock.unlock()
         onLanes?(n)
+        // حارة إضافية طاحت: الملفات اللي عليها ما بتكمل، نوقفها حتى تعيد على الحارات الشغالة
+        if i != 0 && (newState == .failed || newState == .closed) {
+            lock.lock()
+            let o = Array(outs.values)
+            let ii = Array(ins.values)
+            lock.unlock()
+            o.forEach { $0.abort() }
+            ii.forEach { $0.abort() }
+        }
         // حالة الاتصال كله = حالة الحارة 0 (عليها قناة التحكم)
         guard i == 0 else { return }
         let s: String
@@ -255,6 +276,8 @@ enum OutEvent {
 
 final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable {
     let dcs: [RTCDataChannel]
+    /// هل حارة القناة رقم k شغالة؟ (حتى ما نكدّس بيانات على حارة ضعيفة)
+    var laneOK: ((Int) -> Bool)?
     private let stream: AsyncStream<OutEvent>
     private let cont: AsyncStream<OutEvent>.Continuation
 
@@ -275,9 +298,9 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
     }
 
     func dataChannelDidChangeState(_ dataChannel: RTCDataChannel) {
-        guard dataChannel === ctl else { return }
         switch dataChannel.readyState {
-        case .open: cont.yield(.open)
+        case .open: if dataChannel === ctl { cont.yield(.open) }
+        // أي قناة تسكّر = المستقبِل وقف، نعيد المحاولة
         case .closing, .closed: cont.yield(.closed)
         default: break
         }
@@ -326,6 +349,20 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
             try await pump(url: url, offset: offset, size: size, onProgress: onProgress)
         }
 
+        // ننتظر التأكيد، بس مو للأبد: لو ما تحرك شي 45 ثانية نعيد المحاولة
+        // (نحسبها من آخر مرة تحركت فيها البيانات، حتى ما نقطع النقل على النت البطيء)
+        let watchdog = Task { [weak self] in
+            var last = UInt64.max
+            var idle: Double = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                let b = self.totalBuffered()
+                if b != last { last = b; idle = 0 } else { idle += 3 }
+                if idle >= 45 { self.abort(); return }
+            }
+        }
+        defer { watchdog.cancel() }
         var okSeen = false
         while let ev = await it.next() {
             if case .text(let s) = ev, s.contains("\"ok\"") { okSeen = true; break }
@@ -338,7 +375,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
     private func pickChannel() -> RTCDataChannel? {
         var best: RTCDataChannel?
         var bestBuf = UInt64.max
-        for c in dcs where c.readyState == .open {
+        for (k, c) in dcs.enumerated() where c.readyState == .open && (laneOK?(k) ?? true) {
             let b = c.bufferedAmount
             if b < bestBuf { best = c; bestBuf = b }
         }

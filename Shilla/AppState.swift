@@ -2,6 +2,7 @@ import SwiftUI
 import UserNotifications
 import Photos
 import WebRTC
+import CryptoKit
 
 struct FileItem: Sendable {
     let url: URL
@@ -77,9 +78,9 @@ final class AppState: ObservableObject {
         if let data = d.data(forKey: "lastRead"), let l = try? JSONDecoder().decode([String: Double].self, from: data) { lastRead = l }
         loadMessages()
 
-        mqtt.onState = { [weak self] up in Task { @MainActor in self?.mqttUp = up } }
-        mqtt.onConnected = { [weak self] in Task { @MainActor in self?.mqttConnected() } }
-        mqtt.onMessage = { [weak self] topic, data in Task { @MainActor in self?.mqttMessage(topic, data) } }
+        mqtt.onState = { [weak self] b, up in Task { @MainActor in self?.brokerState(b, up) } }
+        mqtt.onConnected = { [weak self] b in Task { @MainActor in self?.mqttConnected(b) } }
+        mqtt.onMessage = { [weak self] topic, data, b in Task { @MainActor in self?.mqttMessage(topic, data, b) } }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
         if keepAlive { KeepAlive.shared.set(true) }
     }
@@ -107,21 +108,45 @@ final class AppState: ObservableObject {
                      willPayload: Data("0".utf8))
     }
 
-    private func mqttConnected() {
-        mqtt.subscribe(inbox(username))
-        for f in friends { mqtt.subscribe(presence(f.id)) }
-        mqtt.publish(topic: presence(username), payload: Data("1".utf8), retain: true)
-        resumeCloudDownloads()
+    private var brokersUp = Set<Int>()
+    /// حضور كل صديق على كل سيرفر: نعتبره متصل لو ظاهر على أي سيرفر
+    private var presenceBy: [String: [Int: Bool]] = [:]
+    /// بصمات آخر الرسائل حتى نشيل المكرر (كل رسالة توصل من 3 سيرفرات)
+    private var seen = Set<Data>()
+    private var seenOrder: [Data] = []
+
+    private func brokerState(_ b: Int, _ up: Bool) {
+        if up { brokersUp.insert(b) } else {
+            brokersUp.remove(b)
+            // حضور هذا السيرفر ما عاد نعرفه، نشيله
+            for u in presenceBy.keys { presenceBy[u]?[b] = nil; recomputePresence(u) }
+        }
+        mqttUp = !brokersUp.isEmpty
     }
 
-    private func mqttMessage(_ topic: String, _ data: Data) {
+    private func mqttConnected(_ b: Int) {
+        mqtt.subscribe(inbox(username))
+        for f in friends { mqtt.subscribe(presence(f.id)) }
+        mqtt.publish(topic: presence(username), payload: Data("1".utf8), retain: true, only: b)
+        if brokersUp.count <= 1 { resumeCloudDownloads() }
+    }
+
+    private func mqttMessage(_ topic: String, _ data: Data, _ b: Int) {
         if topic.hasPrefix(presencePrefix) {
             let u = String(topic.dropFirst(presencePrefix.count))
             guard u != username else { return }
-            presenceChanged(u, on: data == Data("1".utf8))
+            presenceBy[u, default: [:]][b] = (data == Data("1".utf8))
+            recomputePresence(u)
             return
         }
-        guard topic == inbox(username), let d = Crypt.open(data),
+        guard topic == inbox(username) else { return }
+        // نفس الرسالة توصل من أكثر من سيرفر: نعالجها مرة وحدة
+        let fp = Data(SHA256.hash(data: data))
+        guard !seen.contains(fp) else { return }
+        seen.insert(fp)
+        seenOrder.append(fp)
+        if seenOrder.count > 2000 { seen.remove(seenOrder.removeFirst()) }
+        guard let d = Crypt.open(data),
               let from = (d["from"] as? String)?.lowercased(), from != username,
               let t = d["t"] as? String else { return }
         handleInbox(t, from, d)
@@ -130,8 +155,16 @@ final class AppState: ObservableObject {
     private func sendTo(_ peer: String, _ dict: [String: Any]) {
         var d = dict
         d["from"] = username
+        d["sent"] = Date().timeIntervalSince1970
         guard let sealed = Crypt.seal(d) else { return }
-        mqtt.publish(topic: inbox(peer), payload: sealed)
+        // إشارات الاتصال ما تنخزن: لو وصلت متأخرة تخرّب اتصال جديد
+        let signal = ["offer", "answer", "ice", "want"].contains(dict["t"] as? String ?? "")
+        mqtt.publish(topic: inbox(peer), payload: sealed, queue: !signal)
+    }
+
+    private func recomputePresence(_ u: String) {
+        let on = presenceBy[u]?.values.contains(true) ?? false
+        if online[u] != on { presenceChanged(u, on: on) }
     }
 
     private func presenceChanged(_ u: String, on: Bool) {
@@ -146,6 +179,10 @@ final class AppState: ObservableObject {
     }
 
     private func handleInbox(_ t: String, _ from: String, _ d: [String: Any]) {
+        // الإشارات المخزنة عند السيرفر من زمان (وقت كنا أوفلاين) نتجاهلها
+        if ["offer", "answer", "ice", "want"].contains(t),
+           let sent = (d["sent"] as? NSNumber)?.doubleValue,
+           Date().timeIntervalSince1970 - sent > 60 { return }
         switch t {
         case "chat":
             guard let id = d["id"] as? String, let text = d["text"] as? String else { return }

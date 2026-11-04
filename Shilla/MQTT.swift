@@ -1,22 +1,58 @@
 import Foundation
 
-/// عميل MQTT 3.1.1 بسيط فوق WebSocket. نستخدمه مع سيرفرات عامة مجانية
-/// (EMQX / HiveMQ / Mosquitto) كقناة للدردشة وتبادل إشارات الاتصال. كل الرسائل مشفّرة.
-final class MQTTClient: NSObject {
-    var onMessage: ((String, Data) -> Void)?
-    var onState: ((Bool) -> Void)?
-    var onConnected: (() -> Void)?
+/// عميل MQTT يتصل بـ 3 سيرفرات عامة مجانية بنفس الوقت (EMQX / HiveMQ / Mosquitto).
+/// كل رسالة تنرسل على الكل، والمكرر ينشال عند الاستقبال. كذا لو سيرفر طاح
+/// تبقى الدردشة شغالة، وما يصير إنك على سيرفر وربعك على سيرفر ثاني.
+final class MQTTClient {
+    /// (الموضوع، البيانات، رقم السيرفر)
+    var onMessage: ((String, Data, Int) -> Void)?
+    /// (رقم السيرفر، متصل؟)
+    var onState: ((Int, Bool) -> Void)?
+    var onConnected: ((Int) -> Void)?
 
-    private let q = DispatchQueue(label: "shilla.mqtt")
-    private let brokers = [
+    static let brokers = [
         "wss://broker.emqx.io:8084/mqtt",
         "wss://broker.hivemq.com:8884/mqtt",
         "wss://test.mosquitto.org:8081/mqtt",
     ]
+
+    private let conns: [MQTTConn]
+
+    init() {
+        conns = Self.brokers.enumerated().map { MQTTConn(url: $1, index: $0) }
+        for c in conns {
+            c.onMessage = { [weak self] t, d in self?.onMessage?(t, d, c.index) }
+            c.onState = { [weak self] up in self?.onState?(c.index, up) }
+            c.onConnected = { [weak self] in self?.onConnected?(c.index) }
+        }
+    }
+
+    func connect(clientId: String, willTopic: String, willPayload: Data) {
+        conns.forEach { $0.connect(clientId: clientId, willTopic: willTopic, willPayload: willPayload) }
+    }
+
+    func subscribe(_ topic: String) { conns.forEach { $0.subscribe(topic) } }
+
+    /// queue = نخزنها لو السيرفر مو متصل (للدردشة). إشارات الاتصال ما تنخزن لأنها تصير قديمة.
+    func publish(topic: String, payload: Data, retain: Bool = false, queue: Bool = true, only: Int? = nil) {
+        for c in conns where only == nil || only == c.index {
+            c.publish(topic: topic, payload: payload, retain: retain, queue: queue)
+        }
+    }
+}
+
+/// اتصال MQTT 3.1.1 واحد فوق WebSocket.
+final class MQTTConn: NSObject {
+    var onMessage: ((String, Data) -> Void)?
+    var onState: ((Bool) -> Void)?
+    var onConnected: (() -> Void)?
+
+    let index: Int
+    private let urlString: String
+    private let q: DispatchQueue
     private let session = URLSession(configuration: .default)
 
     private var task: URLSessionWebSocketTask?
-    private var brokerIndex = 0
     private var wanted = false
     private var connected = false
     private var clientId = ""
@@ -26,8 +62,15 @@ final class MQTTClient: NSObject {
     private var queued: [(String, Data, Bool)] = []
     private var buffer: [UInt8] = []
     private var packetId: UInt16 = 0
+    private var lastRx = Date()
+    private var backoff: Double = 2
 
-    // MARK: واجهة
+    init(url: String, index: Int) {
+        self.urlString = url
+        self.index = index
+        self.q = DispatchQueue(label: "shilla.mqtt.\(index)")
+        super.init()
+    }
 
     func connect(clientId: String, willTopic: String, willPayload: Data) {
         q.async {
@@ -39,18 +82,6 @@ final class MQTTClient: NSObject {
         }
     }
 
-    func disconnect() {
-        q.async {
-            self.wanted = false
-            self.send(Data([0xE0, 0x00]))
-            let t = self.task
-            self.task = nil
-            self.connected = false
-            t?.cancel(with: .goingAway, reason: nil)
-        }
-    }
-
-    /// اشتراك (يُعاد تلقائياً بعد كل اتصال)
     func subscribe(_ topic: String) {
         q.async {
             let isNew = self.subs.insert(topic).inserted
@@ -58,11 +89,11 @@ final class MQTTClient: NSObject {
         }
     }
 
-    func publish(topic: String, payload: Data, retain: Bool = false) {
+    func publish(topic: String, payload: Data, retain: Bool, queue: Bool) {
         q.async {
             if self.connected {
                 self.sendPublish(topic, payload, retain)
-            } else {
+            } else if queue {
                 if self.queued.count > 300 { self.queued.removeFirst() }
                 self.queued.append((topic, payload, retain))
             }
@@ -72,10 +103,10 @@ final class MQTTClient: NSObject {
     // MARK: داخلي (كله على الطابور q)
 
     private func open() {
-        guard wanted else { return }
+        guard wanted, let url = URL(string: urlString) else { return }
         buffer = []
         connected = false
-        guard let url = URL(string: brokers[brokerIndex % brokers.count]) else { return }
+        lastRx = Date()
         let t = session.webSocketTask(with: url, protocols: ["mqtt"])
         task = t
         t.resume()
@@ -95,8 +126,10 @@ final class MQTTClient: NSObject {
         connected = false
         t.cancel(with: .goingAway, reason: nil)
         if was { onState?(false) }
-        brokerIndex += 1
-        q.asyncAfter(deadline: .now() + 2) { [weak self] in
+        // نعيد المحاولة على نفس السيرفر مع مهلة تكبر تدريجياً (بحد أقصى 30 ثانية)
+        let wait = backoff
+        backoff = min(backoff * 2, 30)
+        q.asyncAfter(deadline: .now() + wait) { [weak self] in
             guard let self, self.wanted, self.task == nil else { return }
             self.open()
         }
@@ -109,6 +142,7 @@ final class MQTTClient: NSObject {
                 guard self.task === t else { return }
                 switch result {
                 case .success(let m):
+                    self.lastRx = Date()
                     switch m {
                     case .data(let d): self.buffer.append(contentsOf: [UInt8](d))
                     case .string(let s): self.buffer.append(contentsOf: [UInt8](s.utf8))
@@ -124,8 +158,13 @@ final class MQTTClient: NSObject {
     }
 
     private func schedulePing(_ t: URLSessionWebSocketTask) {
-        q.asyncAfter(deadline: .now() + 20) { [weak self] in
+        q.asyncAfter(deadline: .now() + 15) { [weak self] in
             guard let self, self.task === t else { return }
+            // لو ما وصلنا شي (ولا حتى رد البنق) من 40 ثانية = الاتصال ميت بصمت
+            if self.connected && Date().timeIntervalSince(self.lastRx) > 40 {
+                self.fail(t)
+                return
+            }
             if self.connected { self.send(Data([0xC0, 0x00])) }
             self.schedulePing(t)
         }
@@ -133,7 +172,6 @@ final class MQTTClient: NSObject {
 
     private func parse() {
         while buffer.count >= 2 {
-            // طول الباقي (متغيّر)
             var mult = 1, len = 0, idx = 1
             var complete = false
             while idx < buffer.count && idx <= 4 {
@@ -156,6 +194,7 @@ final class MQTTClient: NSObject {
         case 2: // CONNACK
             if body.count >= 2, body[1] == 0 {
                 connected = true
+                backoff = 2
                 onState?(true)
                 for s in subs { sendSubscribe(s) }
                 let pending = queued
@@ -215,7 +254,7 @@ final class MQTTClient: NSObject {
     }
 
     private func sendConnect() {
-        // نظافة الجلسة = 0 (حتى تتخزن الرسائل وقت الأوفلاين) + رسالة وصية (will) بقيمة الحضور
+        // نظافة الجلسة = 0 (حتى تتخزن الرسائل وقت الأوفلاين) + رسالة وصية (will) بقيمة الحضور (محفوظة)
         let flags: UInt8 = 0x04 | 0x08 | 0x20
         var vh: [UInt8] = utf("MQTT") + [4, flags, 0, 30]
         var pl: [UInt8] = utf(clientId) + utf(willTopic)

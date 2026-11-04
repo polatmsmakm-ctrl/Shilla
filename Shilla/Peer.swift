@@ -1,12 +1,15 @@
 import Foundation
 import WebRTC
 
-/// عدد القنوات المتوازية لكل ملف
-private let kStripes = 4
-/// حجم القطعة (بدون الترويسة)
-private let kChunk = 65_528
+/// عدد الاتصالات المستقلة لكل صديق. كل اتصال له نافذة ازدحام خاصة (SCTP منفصل)،
+/// فمجموعها يعبّي سرعة الخط بدل ما تتشارك كلها نافذة وحدة.
+let kLanes = 4
+/// أقصى حجم رسالة في WebRTC هو 256KB، نطرح 8 بايت للترويسة
+private let kChunk = 262_136
+/// أقصى بيانات معلّقة في القناة الوحدة قبل ما ننتظر (حد WebRTC الداخلي 16MB)
+private let kMaxBuffered: UInt64 = 6_000_000
 
-/// اتصال مباشر (WebRTC) مع صديق واحد.
+/// اتصال مباشر (WebRTC) مع صديق واحد، مكوّن من عدة «حارات» مستقلة.
 final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     static let factory: RTCPeerConnectionFactory = {
         RTCInitializeSSL()
@@ -15,30 +18,42 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
 
     let peerId: String
     let initiator: Bool
+    /// معرّف هذا الاتصال: أي إشارة من اتصال قديم تنرمي
+    let lid: String
+    let created = Date()
     var onState: ((String) -> Void)?
 
-    private var pc: RTCPeerConnection!
-    private var ctl: RTCDataChannel?
+    private var pcs: [RTCPeerConnection] = []
+    private var ctls: [RTCDataChannel] = []
     private let sendSignal: ([String: Any]) -> Void
     private let makeIncoming: (String) -> IncomingFile
-    private var pending: [RTCIceCandidate] = []
+    private var pending: [[RTCIceCandidate]]
+    private var remoteSet: [Bool]
+    private var laneUp: [Bool]
     private let lock = NSLock()
     private var outs: [ObjectIdentifier: OutgoingFile] = [:]
     private var ins: [String: IncomingFile] = [:]
     private let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
 
-    private(set) var hasRemote = false
+    var hasRemote: Bool { lock.lock(); defer { lock.unlock() }; return remoteSet.contains(true) }
     private(set) var isConnected = false
     private(set) var state = "connecting"
+    /// كم حارة متصلة الحين (للعرض)
+    var lanesUp: Int { lock.lock(); defer { lock.unlock() }; return laneUp.filter { $0 }.count }
 
     init(peerId: String,
          initiator: Bool,
+         lid: String,
          sendSignal: @escaping ([String: Any]) -> Void,
          makeIncoming: @escaping (String) -> IncomingFile) {
         self.peerId = peerId
         self.initiator = initiator
+        self.lid = lid
         self.sendSignal = sendSignal
         self.makeIncoming = makeIncoming
+        self.pending = Array(repeating: [], count: kLanes)
+        self.remoteSet = Array(repeating: false, count: kLanes)
+        self.laneUp = Array(repeating: false, count: kLanes)
         super.init()
 
         let cfg = RTCConfiguration()
@@ -54,54 +69,74 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
         cfg.iceServers = servers
         cfg.sdpSemantics = .unifiedPlan
         cfg.continualGatheringPolicy = .gatherContinually
-        pc = PeerLink.factory.peerConnection(with: cfg, constraints: constraints, delegate: self)
-    }
-
-    // MARK: Signaling
-
-    func makeOffer() {
-        let c = RTCDataChannelConfiguration()
-        ctl = pc.dataChannel(forLabel: "ctl", configuration: c)
-        pc.offer(for: constraints) { [weak self] sdp, _ in
-            guard let self, let sdp else { return }
-            self.pc.setLocalDescription(sdp) { _ in
-                self.sendSignal(["t": "offer", "sdp": sdp.sdp])
+        cfg.bundlePolicy = .maxBundle
+        cfg.rtcpMuxPolicy = .require
+        for _ in 0..<kLanes {
+            if let pc = PeerLink.factory.peerConnection(with: cfg, constraints: constraints, delegate: self) {
+                pcs.append(pc)
             }
         }
     }
 
-    func handleOffer(_ sdp: String) {
-        pc.setRemoteDescription(RTCSessionDescription(type: .offer, sdp: sdp)) { [weak self] _ in
-            guard let self else { return }
-            self.hasRemote = true
-            self.flushCandidates()
-            self.pc.answer(for: self.constraints) { ans, _ in
-                guard let ans else { return }
-                self.pc.setLocalDescription(ans) { _ in
-                    self.sendSignal(["t": "answer", "sdp": ans.sdp])
+    private func lane(of pc: RTCPeerConnection) -> Int? { pcs.firstIndex { $0 === pc } }
+
+    // MARK: Signaling
+
+    func makeOffer() {
+        for (i, pc) in pcs.enumerated() {
+            // قناة أولى إجبارية حتى ينفتح SCTP في العرض
+            if let c = pc.dataChannel(forLabel: "ctl", configuration: RTCDataChannelConfiguration()) { ctls.append(c) }
+            pc.offer(for: constraints) { [weak self] sdp, _ in
+                guard let self, let sdp else { return }
+                pc.setLocalDescription(sdp) { _ in
+                    self.sendSignal(["t": "offer", "sdp": sdp.sdp, "ln": i, "lid": self.lid])
                 }
             }
         }
     }
 
-    func handleAnswer(_ sdp: String) {
-        pc.setRemoteDescription(RTCSessionDescription(type: .answer, sdp: sdp)) { [weak self] _ in
-            self?.hasRemote = true
-            self?.flushCandidates()
+    func handleOffer(lane i: Int, _ sdp: String) {
+        guard i >= 0, i < pcs.count else { return }
+        let pc = pcs[i]
+        pc.setRemoteDescription(RTCSessionDescription(type: .offer, sdp: sdp)) { [weak self] err in
+            guard let self, err == nil else { return }
+            self.markRemote(i)
+            pc.answer(for: self.constraints) { ans, _ in
+                guard let ans else { return }
+                pc.setLocalDescription(ans) { _ in
+                    self.sendSignal(["t": "answer", "sdp": ans.sdp, "ln": i, "lid": self.lid])
+                }
+            }
         }
     }
 
-    func handleIce(_ m: [String: Any]) {
-        guard let sdp = m["candidate"] as? String else { return }
-        let line = Int32((m["mline"] as? NSNumber)?.intValue ?? 0)
-        let cand = RTCIceCandidate(sdp: sdp, sdpMLineIndex: line, sdpMid: m["mid"] as? String)
-        if hasRemote { pc.add(cand) { _ in } } else { pending.append(cand) }
+    func handleAnswer(lane i: Int, _ sdp: String) {
+        guard i >= 0, i < pcs.count else { return }
+        pcs[i].setRemoteDescription(RTCSessionDescription(type: .answer, sdp: sdp)) { [weak self] err in
+            guard err == nil else { return }
+            self?.markRemote(i)
+        }
     }
 
-    private func flushCandidates() {
-        let p = pending
-        pending = []
-        p.forEach { pc.add($0) { _ in } }
+    func handleIce(lane i: Int, _ m: [String: Any]) {
+        guard i >= 0, i < pcs.count, let sdp = m["candidate"] as? String else { return }
+        let line = Int32((m["mline"] as? NSNumber)?.intValue ?? 0)
+        let mid = (m["mid"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let cand = RTCIceCandidate(sdp: sdp, sdpMLineIndex: line, sdpMid: mid)
+        lock.lock()
+        let ready = remoteSet[i]
+        if !ready { pending[i].append(cand) }
+        lock.unlock()
+        if ready { pcs[i].add(cand) { _ in } }
+    }
+
+    private func markRemote(_ i: Int) {
+        lock.lock()
+        remoteSet[i] = true
+        let p = pending[i]
+        pending[i] = []
+        lock.unlock()
+        p.forEach { pcs[i].add($0) { _ in } }
     }
 
     // MARK: Files
@@ -110,10 +145,14 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
                   onProgress: @escaping (Int64) -> Void) async throws {
         let tid = UUID().uuidString
         var dcs: [RTCDataChannel] = []
-        for i in 0..<kStripes {
+        lock.lock(); let up = laneUp; lock.unlock()
+        // القناة رقم 0 (التحكم) دائماً على الحارة 0، والباقي على كل حارة شغالة
+        for (i, pc) in pcs.enumerated() where i == 0 || up[i] {
             let cfg = RTCDataChannelConfiguration()
             cfg.isOrdered = false // بدون انتظار ترتيب = أسرع
-            guard let dc = pc.dataChannel(forLabel: "f:\(tid):\(i)", configuration: cfg) else { throw TErr.closed }
+            guard let dc = pc.dataChannel(forLabel: "f:\(tid):\(i)", configuration: cfg) else {
+                if i == 0 { throw TErr.closed } else { continue }
+            }
             dcs.append(dc)
         }
         let out = OutgoingFile(dcs: dcs)
@@ -135,7 +174,7 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
         lock.unlock()
         o.forEach { $0.abort() }
         i.forEach { $0.abort() }
-        pc.close()
+        pcs.forEach { $0.close() }
     }
 
     // MARK: RTCPeerConnectionDelegate
@@ -148,6 +187,11 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {}
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+        guard let i = lane(of: peerConnection) else { return }
+        let up = (newState == .connected || newState == .completed)
+        lock.lock(); laneUp[i] = up; lock.unlock()
+        // حالة الاتصال كله = حالة الحارة 0 (عليها قناة التحكم)
+        guard i == 0 else { return }
         let s: String
         switch newState {
         case .connected, .completed: s = "connected"
@@ -161,19 +205,21 @@ final class PeerLink: NSObject, RTCPeerConnectionDelegate, @unchecked Sendable {
         if s == "failed" || s == "closed" {
             lock.lock()
             let o = Array(outs.values)
-            let i = Array(ins.values)
+            let ii = Array(ins.values)
             lock.unlock()
             o.forEach { $0.abort() }
-            i.forEach { $0.abort() }
+            ii.forEach { $0.abort() }
         }
         onState?(s)
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
+        guard let i = lane(of: peerConnection) else { return }
         sendSignal(["t": "ice",
                     "candidate": candidate.sdp,
                     "mline": Int(candidate.sdpMLineIndex),
-                    "mid": candidate.sdpMid ?? ""])
+                    "mid": candidate.sdpMid ?? "",
+                    "ln": i, "lid": lid])
     }
 
     func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
@@ -294,7 +340,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
             let b = c.bufferedAmount
             if b < bestBuf { best = c; bestBuf = b }
         }
-        if let b = best, bestBuf < 3_000_000 { return b }
+        if let b = best, bestBuf < kMaxBuffered { return b }
         return nil
     }
 
@@ -311,7 +357,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
         var lastReport = Date.distantPast
         while sent < size {
             if Task.isCancelled || ctl.readyState != .open { throw TErr.closed }
-            guard let block = try h.read(upToCount: 1 << 20), !block.isEmpty else { break }
+            guard let block = try h.read(upToCount: 4 << 20), !block.isEmpty else { break }
             var i = 0
             while i < block.count {
                 let end = min(i + kChunk, block.count)
@@ -325,7 +371,7 @@ final class OutgoingFile: NSObject, RTCDataChannelDelegate, @unchecked Sendable 
                         if !ch.sendData(RTCDataBuffer(data: frame, isBinary: true)) { throw TErr.closed }
                         break
                     }
-                    try await Task.sleep(nanoseconds: 2_000_000)
+                    try await Task.sleep(nanoseconds: 1_000_000)
                 }
                 i = end
             }

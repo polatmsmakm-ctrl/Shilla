@@ -3,10 +3,25 @@ import UserNotifications
 import Photos
 import WebRTC
 
-struct FileItem {
+struct FileItem: Sendable {
     let url: URL
     let rel: String
     let size: Int64
+}
+
+/// تقدّم دفعة ملفات تنرسل بالتوازي
+@MainActor
+final class BatchTracker {
+    var base: Int64 = 0
+    var done = 0
+    var live: [Int: Int64] = [:]
+    var total: Int64 { base + live.values.reduce(0, +) }
+}
+
+/// غلاف بسيط حتى نمرر القاموس بين المهام
+struct SendableMeta: @unchecked Sendable {
+    let value: [String: Any]
+    init(_ v: [String: Any]) { value = v }
 }
 
 @MainActor
@@ -41,6 +56,8 @@ final class AppState: ObservableObject {
     private var lastPublish: [String: Date] = [:]
     private var recvBase: [String: Int64] = [:]
     private var recvCount: [String: Int] = [:]
+    /// بايتات الملفات اللي جاري استقبالها الحين لكل دفعة (تنرسل بالتوازي)
+    private var recvLive: [String: [String: Int64]] = [:]
 
     var isSetup: Bool { !username.isEmpty }
 
@@ -147,15 +164,25 @@ final class AppState: ObservableObject {
             }
         case "offer":
             guard let sdp = d["sdp"] as? String else { return }
+            let lid = d["lid"] as? String ?? ""
+            let ln = (d["ln"] as? NSNumber)?.intValue ?? 0
             addFriendIfNeeded(from)
+            if let l = links[from], l.lid == lid, !l.initiator {
+                // حارة إضافية لنفس الاتصال
+                l.handleOffer(lane: ln, sdp)
+                return
+            }
             // لو الاثنين عرضوا بنفس الوقت: اللي اسمه أكبر هو اللي يكمل
             if let l = links[from], l.initiator, !l.hasRemote, username > from { return }
-            makeLink(from, initiator: false)
-            links[from]?.handleOffer(sdp)
+            makeLink(from, initiator: false, lid: lid)
+            links[from]?.handleOffer(lane: ln, sdp)
         case "answer":
-            if let sdp = d["sdp"] as? String { links[from]?.handleAnswer(sdp) }
+            // نتجاهل أي رد من اتصال قديم
+            guard let sdp = d["sdp"] as? String, let l = links[from], l.lid == (d["lid"] as? String ?? "") else { return }
+            l.handleAnswer(lane: (d["ln"] as? NSNumber)?.intValue ?? 0, sdp)
         case "ice":
-            links[from]?.handleIce(d)
+            guard let l = links[from], l.lid == (d["lid"] as? String ?? "") else { return }
+            l.handleIce(lane: (d["ln"] as? NSNumber)?.intValue ?? 0, d)
         case "cloud":
             guard let bid = d["bid"] as? String, let mk = d["mk"] as? String,
                   let name = d["bname"] as? String else { return }
@@ -214,11 +241,12 @@ final class AppState: ObservableObject {
         // غير كذا ننتظر هو يبدأ (يوصله حضورنا المحفوظ)
     }
 
-    private func makeLink(_ u: String, initiator: Bool) {
+    private func makeLink(_ u: String, initiator: Bool, lid: String = UUID().uuidString) {
         links[u]?.close()
         let link = PeerLink(
             peerId: u,
             initiator: initiator,
+            lid: lid,
             sendSignal: { [weak self] d in
                 Task { @MainActor in self?.sendTo(u, d) }
             },
@@ -369,7 +397,18 @@ final class AppState: ObservableObject {
     }
 
     private func recvStart(_ meta: FileMeta, _ from: String) {
-        guard !messages.contains(where: { $0.id == meta.bid }) else { return }
+        if let i = messages.firstIndex(where: { $0.id == meta.bid }) {
+            // استكمال بعد انقطاع: نرجّع الحالة لـ «جاري»
+            if progress[meta.bid]?.failed == true || messages[i].status == "failed" {
+                var st = progress[meta.bid] ?? TransferState()
+                st.failed = false
+                st.note = ""
+                progress[meta.bid] = st
+                messages[i].status = "active"
+                refreshActivity()
+            }
+            return
+        }
         let b = BatchInfo(bid: meta.bid, name: meta.bname, size: meta.bsize, count: meta.bcount,
                           isFolder: meta.isFolder, kind: meta.kind)
         appendMessage(ChatMessage(id: meta.bid, peer: from, ts: Date().timeIntervalSince1970, text: nil,
@@ -382,11 +421,14 @@ final class AppState: ObservableObject {
     }
 
     private func recvProgress(_ meta: FileMeta, _ bytes: Int64) {
-        guard progress[meta.bid]?.failed != true else { return }
-        setBytes(meta.bid, (recvBase[meta.bid] ?? 0) + bytes)
+        guard progress[meta.bid]?.failed != true, progress[meta.bid]?.finished != true else { return }
+        recvLive[meta.bid, default: [:]][meta.rel] = bytes
+        let live = recvLive[meta.bid]?.values.reduce(0, +) ?? 0
+        setBytes(meta.bid, (recvBase[meta.bid] ?? 0) + live)
     }
 
     private func recvFinish(_ meta: FileMeta, _ from: String, _ top: String) {
+        recvLive[meta.bid]?[meta.rel] = nil
         recvBase[meta.bid, default: 0] += meta.size
         recvCount[meta.bid, default: 0] += 1
         let count = recvCount[meta.bid] ?? 0
@@ -396,8 +438,10 @@ final class AppState: ObservableObject {
         var st = progress[meta.bid] ?? TransferState()
         st.files = count
         progress[meta.bid] = st
-        setBytes(meta.bid, recvBase[meta.bid] ?? 0, force: true)
+        let live = recvLive[meta.bid]?.values.reduce(0, +) ?? 0
+        setBytes(meta.bid, (recvBase[meta.bid] ?? 0) + live, force: true)
         if count >= meta.bcount {
+            recvLive[meta.bid] = nil
             finish(meta.bid, ok: true)
             if activeChat == from { markRead(from) }
             notify(from, "وصلك: \(meta.bname)")
@@ -416,16 +460,23 @@ final class AppState: ObservableObject {
         Task { await runSend(urls, peer) }
     }
 
+    private var lastRequest: [String: Date] = [:]
+
     private func waitConnected(_ peer: String, timeout: Double) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
-        var asked = false
         while Date() < deadline {
             if links[peer]?.isConnected == true { return true }
-            if !asked || (links[peer] == nil && online[peer] == true) {
-                asked = true
+            // نطلب اتصال جديد فقط لو ما فيه اتصال شغال أو قيد التجهيز،
+            // ومو أكثر من مرة كل 8 ثواني (حتى ما نقطع اتصال قاعد يتجهز)
+            let l = links[peer]
+            let stuck = l.map { $0.state == "connecting" && Date().timeIntervalSince($0.created) > 25 } ?? false
+            let dead = l == nil || l?.state == "failed" || l?.state == "closed" || stuck
+            let recent = lastRequest[peer].map { Date().timeIntervalSince($0) < 8 } ?? false
+            if dead && !recent && online[peer] == true {
+                lastRequest[peer] = Date()
                 requestConnection(peer)
             }
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
         return links[peer]?.isConnected == true
     }
@@ -477,46 +528,57 @@ final class AppState: ObservableObject {
                 continue
             }
 
-            var base: Int64 = 0
-            var doneFiles = 0
+            // الملفات الكبيرة وحدة وحدة (تاخذ الخط كامل)، والصغيرة عدة ملفات بنفس الوقت
+            // حتى ما يضيع الوقت بانتظار الردود بين ملف وملف.
+            let tr = BatchTracker()
             var failedAll = false
+            let maxParallel = 4
+            let bigFile: Int64 = 64 * 1024 * 1024
 
-            fileLoop: for f in listing.files {
-                let b0 = base
-                let meta: [String: Any] = [
-                    "bid": bid, "bname": batch.name, "bsize": total, "bcount": batch.count,
-                    "folder": batch.isFolder, "kind": kind, "rel": f.rel, "size": f.size,
-                ]
-                var ok = false
-                var attempt = 0
-                while attempt < 6 && !ok {
-                    await waitOnline(peer, bid)
-                    attempt += 1
-                    let connected = await waitConnected(peer, timeout: attempt == 1 ? 20 : 120)
-                    guard connected, let link = links[peer] else {
-                        if attempt >= 3 { break }
-                        continue
-                    }
-                    do {
-                        try await link.sendFile(meta: meta, url: f.url, size: UInt64(f.size)) { cur in
-                            Task { @MainActor in self.setBytes(bid, b0 + cur) }
+            await withTaskGroup(of: (Int, Bool).self) { group in
+                var next = 0
+                var running = 0
+                func launch() {
+                    while next < listing.files.count && running < maxParallel && !failedAll {
+                        let idx = next
+                        let f = listing.files[idx]
+                        // ملف كبير ما يشتغل مع غيره
+                        if f.size >= bigFile && running > 0 { break }
+                        next += 1
+                        running += 1
+                        let meta: [String: Any] = [
+                            "bid": bid, "bname": batch.name, "bsize": total, "bcount": batch.count,
+                            "folder": batch.isFolder, "kind": kind, "rel": f.rel, "size": f.size,
+                        ]
+                        let sendable = SendableMeta(meta)
+                        group.addTask { @MainActor in
+                            let ok = await self.sendOne(f, meta: sendable.value, peer: peer, bid: bid) { cur in
+                                tr.live[idx] = cur
+                                self.setBytes(bid, tr.total)
+                            }
+                            return (idx, ok)
                         }
-                        ok = true
-                    } catch {
-                        var st = progress[bid] ?? TransferState()
-                        st.note = "انقطع الاتصال، جاري إعادة المحاولة…"
-                        progress[bid] = st
-                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        if f.size >= bigFile { break }
                     }
                 }
-                if !ok { failedAll = true; break fileLoop }
-                base += f.size
-                doneFiles += 1
-                var st = progress[bid] ?? TransferState()
-                st.files = doneFiles
-                st.note = ""
-                progress[bid] = st
-                setBytes(bid, base, force: true)
+                launch()
+                while let r = await group.next() {
+                    let (idx, ok) = r
+                    running -= 1
+                    tr.live[idx] = nil
+                    if ok {
+                        tr.base += listing.files[idx].size
+                        tr.done += 1
+                        var st = progress[bid] ?? TransferState()
+                        st.files = tr.done
+                        st.note = ""
+                        progress[bid] = st
+                        setBytes(bid, tr.total, force: true)
+                    } else {
+                        failedAll = true
+                    }
+                    launch()
+                }
             }
 
             if failedAll {
@@ -527,6 +589,33 @@ final class AppState: ObservableObject {
             let tmp = FileManager.default.temporaryDirectory.path
             if url.path.hasPrefix(tmp) { try? FileManager.default.removeItem(at: url) }
         }
+    }
+
+    /// يرسل ملف واحد مع إعادة المحاولة. الاستكمال من نفس المكان يصير تلقائياً عند المستقبِل.
+    private func sendOne(_ f: FileItem, meta: [String: Any], peer: String, bid: String,
+                         onBytes: @escaping @MainActor (Int64) -> Void) async -> Bool {
+        var attempt = 0
+        while attempt < 8 {
+            await waitOnline(peer, bid)
+            attempt += 1
+            let connected = await waitConnected(peer, timeout: attempt == 1 ? 20 : 90)
+            guard connected, let link = links[peer] else {
+                if attempt >= 4 { return false }
+                continue
+            }
+            do {
+                try await link.sendFile(meta: meta, url: f.url, size: UInt64(f.size)) { cur in
+                    Task { @MainActor in onBytes(cur) }
+                }
+                return true
+            } catch {
+                var st = progress[bid] ?? TransferState()
+                st.note = "انقطع الاتصال، جاري إعادة المحاولة…"
+                progress[bid] = st
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+        }
+        return false
     }
 
     private nonisolated static func listFiles(_ url: URL) -> (isFolder: Bool, files: [FileItem]) {

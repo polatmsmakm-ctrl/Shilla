@@ -62,6 +62,8 @@ const game = startGame($('game'), unlock);
 
 function unlock() {
   unlocked = true;
+  app.locked = false;
+  if (current) app.markRead(current);
   game.pause();
   $('game').hidden = true;
   $('app').hidden = false;
@@ -72,6 +74,7 @@ function unlock() {
 function lock() {
   if (!unlocked) return;
   unlocked = false;
+  app.locked = true;
   closeModal();
   $('app').hidden = true;
   $('game').hidden = false;

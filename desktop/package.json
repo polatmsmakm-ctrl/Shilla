@@ -1,7 +1,7 @@
 {
   "name": "jellyjump",
   "productName": "Jelly Jump",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Jelly Jump",
   "main": "main.js",
   "scripts": {

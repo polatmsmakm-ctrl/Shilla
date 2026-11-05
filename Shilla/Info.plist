@@ -32,6 +32,8 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Play with friends on the same network.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>لاختيار الصور والفيديوهات اللي تبي ترسلها.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

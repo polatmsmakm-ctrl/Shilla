@@ -4,6 +4,8 @@ const path = require('path');
 let win;
 app.setAppUserModelId('com.rashid.jellyjump');
 Menu.setApplicationMenu(null);
+// نبيّن عنوان الشبكة المحلية الحقيقي حتى الاتصال على نفس الواي فاي يكون مباشر وأسرع
+app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 
 function create() {
   win = new BrowserWindow({

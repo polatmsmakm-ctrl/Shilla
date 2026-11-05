@@ -73,6 +73,7 @@ class App extends EventTarget {
     this.recvDone = {};
     this.lastSample = {};
     this.activeChat = null;
+    this.locked = true;
 
     this.receivedDir = path.join(os.homedir(), 'Downloads', 'JellyJump');
     fs.mkdirSync(this.receivedDir, { recursive: true });
@@ -187,7 +188,7 @@ class App extends EventTarget {
   // ---------- الرسائل الواردة ----------
 
   handleInbox(t, from, d) {
-    if (SIGNALS.includes(t) && typeof d.sent === 'number' && now() - d.sent > 60) return;
+    if (SIGNALS.includes(t) && typeof d.sent === 'number' && now() - d.sent > 600) return;
     switch (t) {
       case 'chat': {
         if (typeof d.id !== 'string' || typeof d.text !== 'string') return;
@@ -245,6 +246,9 @@ class App extends EventTarget {
         if (!m || m.peer !== from) return;
         this.cancelled.add(d.bid);
         if (this.sendTasks[d.bid]) this.sendTasks[d.bid].cancel = true;
+        // نوقف الملف اللي ينرسل الحين فوراً
+        const cl = this.links[from];
+        if (cl) cl.outs.forEach((o) => { if (o.bid === d.bid) o.abort(); });
         const p = this.progress[d.bid];
         if (p ? !p.finished : m.status === 'active') {
           this.finish(d.bid, false, `ألغاه @${from}`, true);
@@ -374,6 +378,7 @@ class App extends EventTarget {
   }
   get totalUnread() { return this.friends.reduce((a, f) => a + this.unread(f.id), 0); }
   markRead(peer) {
+    if (this.locked) return;
     const l = this.last(peer);
     if (!l) return;
     if ((this.lastRead[peer] || 0) >= l.ts) return;
@@ -415,7 +420,7 @@ class App extends EventTarget {
 
   notify() {
     // تنبيه متخفي (شكل لعبة) لما البرنامج مو قدامك
-    if (document.hasFocus() && !document.hidden) return;
+    if (document.hasFocus() && !document.hidden && !this.locked) return;
     try { new Notification('Jelly Jump', { body: '🎁 مكافأة جديدة بانتظارك!', silent: false }); } catch (_) {}
   }
 
@@ -513,6 +518,7 @@ class App extends EventTarget {
   }
 
   recvFinish(meta, from, top) {
+    if (this.cancelled.has(meta.bid)) return;
     if (this.recvLive[meta.bid]) delete this.recvLive[meta.bid][meta.rel];
     const done = (this.recvDone[meta.bid] = this.recvDone[meta.bid] || new Set());
     if (done.has(meta.rel)) return;

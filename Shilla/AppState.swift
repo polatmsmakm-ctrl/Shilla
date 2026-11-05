@@ -49,6 +49,8 @@ final class AppState: ObservableObject {
     @Published var mqttUp = false
     @Published var toast: String?
     var activeChat: String?
+    /// البرنامج مخفي ورا اللعبة: ما نعلّم الرسائل كمقروءة
+    var locked = true
 
     private let mqtt = MQTTClient()
     private var links: [String: PeerLink] = [:]
@@ -185,7 +187,7 @@ final class AppState: ObservableObject {
         // الإشارات المخزنة عند السيرفر من زمان (وقت كنا أوفلاين) نتجاهلها
         if ["offer", "answer", "ice", "want"].contains(t),
            let sent = (d["sent"] as? NSNumber)?.doubleValue,
-           Date().timeIntervalSince1970 - sent > 60 { return }
+           Date().timeIntervalSince1970 - sent > 600 { return }
         switch t {
         case "chat":
             guard let id = d["id"] as? String, let text = d["text"] as? String else { return }
@@ -382,6 +384,7 @@ final class AppState: ObservableObject {
     }
 
     func markRead(_ peer: String) {
+        guard !locked else { return }
         lastRead[peer] = Date().timeIntervalSince1970 + 1
         if let d = try? JSONEncoder().encode(lastRead) { UserDefaults.standard.set(d, forKey: "lastRead") }
     }
@@ -517,6 +520,7 @@ final class AppState: ObservableObject {
     }
 
     private func recvFinish(_ meta: FileMeta, _ from: String, _ top: String) {
+        guard !cancelled.contains(meta.bid) else { return }
         recvLive[meta.bid]?[meta.rel] = nil
         // ملف وصل من قبل (إعادة إرسال للمجلد كامل): ما نعدّه مرة ثانية
         guard recvDone[meta.bid, default: []].insert(meta.rel).inserted else { return }
@@ -1004,7 +1008,7 @@ final class AppState: ObservableObject {
     }
 
     private func notify(_ title: String, _ body: String) {
-        guard UIApplication.shared.applicationState != .active else { return }
+        guard UIApplication.shared.applicationState != .active || locked else { return }
         // تنبيه متخفي بشكل لعبة (ما يبين اسم المرسل ولا المحتوى)
         let c = UNMutableNotificationContent()
         c.title = "Jelly Jump"

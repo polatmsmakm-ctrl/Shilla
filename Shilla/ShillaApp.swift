@@ -28,6 +28,16 @@ struct ShillaApp: App {
         UINavigationBar.appearance().compactAppearance = nav
     }
 
+    /// نسكّر أي نافذة مفتوحة فوق (معاينة ملف، اختيار ملفات…) حتى ما تطلع ورا اللعبة
+    static func dismissPresented() {
+        for scene in UIApplication.shared.connectedScenes {
+            guard let ws = scene as? UIWindowScene else { continue }
+            for w in ws.windows where w.rootViewController?.presentedViewController != nil {
+                w.rootViewController?.dismiss(animated: false)
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             ZStack {
@@ -39,6 +49,8 @@ struct ShillaApp: App {
                     GameView(onReveal: {
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         withAnimation(.easeOut(duration: 0.2)) { unlocked = true }
+                        app.locked = false
+                        if let c = app.activeChat { app.markRead(c) }
                     })
                     .transition(.opacity)
                 }
@@ -68,6 +80,8 @@ struct ShillaApp: App {
                 case .background:
                     covered = true
                     unlocked = false
+                    app.locked = true
+                    Self.dismissPresented()
                 @unknown default: break
                 }
             }

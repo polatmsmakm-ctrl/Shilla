@@ -1005,9 +1005,10 @@ final class AppState: ObservableObject {
 
     private func notify(_ title: String, _ body: String) {
         guard UIApplication.shared.applicationState != .active else { return }
+        // تنبيه متخفي بشكل لعبة (ما يبين اسم المرسل ولا المحتوى)
         let c = UNMutableNotificationContent()
-        c.title = title
-        c.body = body
+        c.title = "Jelly Jump"
+        c.body = "🎁 مكافأة جديدة بانتظارك!"
         c.sound = .default
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
     }

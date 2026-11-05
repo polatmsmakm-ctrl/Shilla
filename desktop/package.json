@@ -1,0 +1,25 @@
+{
+  "name": "jellyjump",
+  "productName": "Jelly Jump",
+  "version": "1.0.0",
+  "description": "Jelly Jump",
+  "main": "main.js",
+  "scripts": {
+    "secrets": "node gen-secrets.js",
+    "start": "node gen-secrets.js && electron .",
+    "test": "node test/protocol.test.js",
+    "dist": "node gen-secrets.js && electron-builder --win portable --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "^31.7.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.rashid.jellyjump",
+    "productName": "Jelly Jump",
+    "files": ["main.js", "index.html", "style.css", "src/**/*", "build/icon.png"],
+    "win": { "target": "portable", "icon": "build/icon.png" },
+    "portable": { "artifactName": "JellyJump.exe" },
+    "directories": { "output": "dist" }
+  }
+}

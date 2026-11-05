@@ -19,8 +19,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.rashid.shilla
         PRODUCT_NAME: Shilla
-        MARKETING_VERSION: "1.2"
-        CURRENT_PROJECT_VERSION: "6"
+        MARKETING_VERSION: "1.3"
+        CURRENT_PROJECT_VERSION: "7"
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: Shilla/Info.plist

@@ -136,8 +136,8 @@ function startGame(canvas, onReveal) {
     ctx.arc(x - r * 0.25, y - r * 0.25, r * 0.78, 0, Math.PI * 2);
     ctx.arc(x + r * 0.55, y - r * 0.05, r * 0.68, 0, Math.PI * 2);
     ctx.arc(x + r * 1.05, y + r * 0.25, r * 0.48, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillRect(x - r * 0.9, y + r * 0.1, r * 1.95, r * 0.6);
+    ctx.rect(x - r * 0.9, y + r * 0.1, r * 1.95, r * 0.6);
+    ctx.fill('nonzero');
     ctx.restore();
   }
 
@@ -149,7 +149,7 @@ function startGame(canvas, onReveal) {
     sun.addColorStop(0, 'rgba(255,235,150,0.85)'); sun.addColorStop(1, 'rgba(255,235,150,0)');
     ctx.fillStyle = sun; ctx.fillRect(0, 0, W, H);
 
-    drawCloud(cloud.x, cloud.y, cloud.r, 0.95);
+    drawCloud(cloud.x, cloud.y, cloud.r, 1);
 
     const gy = groundY();
     ctx.fillStyle = '#2eaa6e';

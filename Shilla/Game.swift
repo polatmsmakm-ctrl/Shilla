@@ -179,13 +179,13 @@ final class JellyGame {
     }
 
     private func drawCloud(_ ctx: inout GraphicsContext, _ c: CGPoint, _ r: CGFloat) {
-        var p = Path()
+        // كل جزء ينرسم لحاله بلون كامل (حتى ما تطلع خطوط عند التداخل)
         func circ(_ dx: CGFloat, _ dy: CGFloat, _ rr: CGFloat) {
-            p.addEllipse(in: CGRect(x: c.x + r * dx - r * rr, y: c.y + r * dy - r * rr, width: 2 * r * rr, height: 2 * r * rr))
+            ctx.fill(Path(ellipseIn: CGRect(x: c.x + r * dx - r * rr, y: c.y + r * dy - r * rr, width: 2 * r * rr, height: 2 * r * rr)),
+                     with: .color(.white))
         }
         circ(-0.9, 0.15, 0.6); circ(-0.25, -0.25, 0.78); circ(0.55, -0.05, 0.68); circ(1.05, 0.25, 0.48)
-        p.addRect(CGRect(x: c.x - r * 0.9, y: c.y + r * 0.1, width: r * 1.95, height: r * 0.6))
-        ctx.fill(p, with: .color(.white.opacity(0.95)))
+        ctx.fill(Path(CGRect(x: c.x - r * 0.9, y: c.y + r * 0.1, width: r * 1.95, height: r * 0.6)), with: .color(.white))
     }
 
     private func drawJelly(_ ctx: inout GraphicsContext) {

@@ -36,16 +36,16 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/Shilla.app Payload/
-          zip -qr Shilla.ipa Payload
+          zip -qr JellyJum.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
-          name: Shilla-ipa
-          path: Shilla.ipa
+          name: JellyJum-ipa
+          path: JellyJum.ipa
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" Shilla.ipa \
+          gh release create "build-${{ github.run_number }}" JellyJum.ipa \
             --repo "${{ github.repository }}" \
             --title "Shilla build ${{ github.run_number }}" \
             --notes "Unsigned IPA. Sign and install with Sideloadly."
